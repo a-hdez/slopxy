@@ -54,7 +54,7 @@ def parse_entry(line: str) -> Entry | None:
     """Parse one list line. Returns None for blanks/comments/section headers.
     Tags: `[full]` full-art, `[art: prompt]` custom prompt, `[image: path | fit]` your own art,
     `[runs: N]` N separate art generations.
-    A path to a proxygen output PNG reproduces that image."""
+    A path to a slopxy output PNG reproduces that image."""
     line = line.strip()
     if not line or line.startswith("#") or line.startswith("//"):
         return None
@@ -102,7 +102,7 @@ def safe_filename(name: str) -> str:
 
 def _interactive() -> list[str]:
     print("Enter card names (optionally Name|SET, [full] for full-art, [art: prompt] for a "
-          "custom art prompt, [image: file] for your own art) or proxygen PNGs to reproduce, "
+          "custom art prompt, [image: file] for your own art) or slopxy PNGs to reproduce, "
           "one per line. Blank line to finish.")
     lines = []
     while True:
@@ -140,10 +140,10 @@ class ArtContext:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="proxygen", description="Generate MTG proxy card images.")
+    ap = argparse.ArgumentParser(prog="slopxy", description="Generate MTG proxy card images.")
     ap.add_argument("cards", nargs="*",
                     help='card names, e.g. "Lightning Bolt", "Lightning Bolt|M10", "Sol Ring [full]", '
-                         'or a proxygen output PNG to reproduce')
+                         'or a slopxy output PNG to reproduce')
     ap.add_argument("-f", "--file", help="text file with one card per line (decklist formats accepted)")
     ap.add_argument("-o", "--out", default="output", help="output directory (default: ./output)")
     ap.add_argument("--data", help="path to Scryfall bulk JSONL (default: newest default-cards-*.jsonl here)")
@@ -317,7 +317,7 @@ def _load_repro(e: Entry, missing: list) -> bool:
         missing.append((str(e.png), [], f"could not read it ({err})"))
         return False
     if not meta or "card" not in meta:
-        missing.append((str(e.png), [], "it has no proxygen metadata to reproduce from"))
+        missing.append((str(e.png), [], "it has no slopxy metadata to reproduce from"))
         return False
     e.name, e.set_code = meta["card"], meta.get("set")
     e.full_art, e.art_prompt, e.repro = bool(meta.get("full_art")), meta.get("custom_prompt"), meta

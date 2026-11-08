@@ -1,13 +1,13 @@
-# proxygen — MTG proxy card generator
+# slopxy — MTG proxy card generator
 
 Builds proxy card images from scratch (frame, mana symbols, rules text) using the
 local Scryfall bulk file `default-cards-*.jsonl`. The art window is transparent, or filled
 with AI art from a local ComfyUI (see below).
 
 Mana symbols (in the title bar and in rules text) use the badges in
-`proxygen/assets/*_badge.svg` (star W, droplet U, skull B, fireball R, tree G, diamond C, phi for
+`slopxy/assets/*_badge.svg` (star W, droplet U, skull B, fireball R, tree G, diamond C, phi for
 Phyrexian). Hybrid costs combine two badges on a split circle. Generic numbers, X, snow and tap
-are still drawn by `proxygen/symbols.py`.
+are still drawn by `slopxy/symbols.py`.
 
 ## Setup
 Requires Python 3.10+.
@@ -16,7 +16,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 Download the **Default Cards** bulk file from https://scryfall.com/docs/api/bulk-data and put
-the `default-cards-*.jsonl` file in the folder you run proxygen from (or pass `--data PATH`).
+the `default-cards-*.jsonl` file in the folder you run slopxy from (or pass `--data PATH`).
 It is not in the repository because of its size (~650 MB).
 
 Fonts: Palatino and Arial from Windows are used when present; otherwise Georgia/Times or
@@ -24,9 +24,9 @@ DejaVu are used as fallbacks, so cards look slightly different on other systems.
 
 ## Usage
 ```
-.venv\Scripts\python.exe -m proxygen "Lightning Bolt" "Fire // Ice"
-.venv\Scripts\python.exe -m proxygen -f decklist.txt -o output
-.venv\Scripts\python.exe -m proxygen            # interactive: type names, blank line to finish
+.venv\Scripts\python.exe -m slopxy "Lightning Bolt" "Fire // Ice"
+.venv\Scripts\python.exe -m slopxy -f decklist.txt -o output
+.venv\Scripts\python.exe -m slopxy            # interactive: type names, blank line to finish
 ```
 
 - `Name|SET` picks a specific printing (e.g. `Lightning Bolt|M10`); otherwise the latest
@@ -50,9 +50,9 @@ DejaVu are used as fallbacks, so cards look slightly different on other systems.
 ## Printable sheets
 Add `--sheet` to get a print-ready multi-page PDF (quantities honored) instead of single images:
 ```
-.venv\Scripts\python.exe -m proxygen -f decklist.txt --sheet
-.venv\Scripts\python.exe -m proxygen -f decklist.txt --sheet --paper a4 --cut-lines marks
-.venv\Scripts\python.exe -m proxygen -f decklist.txt --sheet --art --sheet-name modern.pdf
+.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet
+.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet --paper a4 --cut-lines marks
+.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet --art --sheet-name modern.pdf
 ```
 - Cards are true size (2.5×3.5in); print at **100% / actual size**, not "fit to page".
 - `--paper letter|a4|legal|a3|tabloid` or custom `210x297mm` / `8.5x11in` (default letter).
@@ -67,8 +67,8 @@ Add `--sheet` to get a print-ready multi-page PDF (quantities honored) instead o
 ## AI art (ComfyUI)
 Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--art`:
 ```
-.venv\Scripts\python.exe -m proxygen --art "Lightning Bolt" "Sol Ring [full]"
-.venv\Scripts\python.exe -m proxygen --art -f decklist.txt --prompts prompts.txt
+.venv\Scripts\python.exe -m slopxy --art "Lightning Bolt" "Sol Ring [full]"
+.venv\Scripts\python.exe -m slopxy --art -f decklist.txt --prompts prompts.txt
 ```
 - Prompts: before each image, the Qwen3-VL language model (the Krea 2 text encoder, run
   through ComfyUI's built-in Generate Text node) reads the card's name, type, colors, rules
@@ -79,7 +79,7 @@ Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--a
   of `Card Name = prompt` lines (face names work for double-faced/split cards).
 - Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, and snow-covered ones) are
   always pure landscapes. Each image picks a scene from a catalog for its land type
-  (`LAND_SCENES` in `proxygen/art.py`), plus a time of day or weather. Forests are seen from
+  (`LAND_SCENES` in `slopxy/art.py`), plus a time of day or weather. Forests are seen from
   above, from afar or from under the canopy; Islands show real coastlines and islands;
   Mountains show ranges, volcanoes and lone peaks; Swamps are dead, drowned bogs. The prompt
   bans people, buildings, ruins, carvings, runes and magic effects. With `--runs`, each run
@@ -87,7 +87,7 @@ Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--a
 - Nothing is cached: every `--art` run picks a random seed (unless `--seed N`) and writes new
   art. Everything needed to recreate an image (card, printing, full-art flag, and per art
   window the scene description, prompt, model, checkpoint, seed and size) is embedded in the
-  output PNG as a `proxygen` text chunk.
+  output PNG as a `slopxy` text chunk.
 - `--art-model`:
   - `krea2-turbo` (default): Krea 2 Turbo int8 (`diffusion_models/krea2_turbo_int8_convrot`)
     with the `qwen3vl_4b_fp8_scaled` text encoder and `qwen_image_vae`.
@@ -100,8 +100,8 @@ Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--a
 `--runs N` generates art N times for every card, one image per run; `[runs: N]` does it for
 one line of a list:
 ```
-.venv\Scripts\python.exe -m proxygen --art "Forest [full]" --runs 10
-.venv\Scripts\python.exe -m proxygen --art "Forest [full] [runs: 10]" "Sol Ring"
+.venv\Scripts\python.exe -m slopxy --art "Forest [full]" --runs 10
+.venv\Scripts\python.exe -m slopxy --art "Forest [full] [runs: 10]" "Sol Ring"
 ```
 - Each run gets its own scene description and seed, saved as `Forest (full art).png`,
   `Forest (full art) (1).png`, ... (with `--overwrite`, runs still never replace each other).
@@ -112,12 +112,12 @@ one line of a list:
 - Runs apply only to generated art; `[image: ...]` and art-less cards render once.
 
 ## Reproducing a card
-Give a proxygen output PNG instead of a card name (on the command line or in a list file,
+Give a slopxy output PNG instead of a card name (on the command line or in a list file,
 with a quantity if you like) and it is rebuilt exactly from its embedded metadata:
 ```
-.venv\Scripts\python.exe -m proxygen "output/Sol Ring.png"
-.venv\Scripts\python.exe -m proxygen "output/Sol Ring.png" --new-seed     # same scene, new image
-.venv\Scripts\python.exe -m proxygen "output/Sol Ring.png" --redescribe   # new scene, same seed
+.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png"
+.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png" --new-seed     # same scene, new image
+.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png" --redescribe   # new scene, same seed
 ```
 - `--seed N` sets the seed explicitly. Generated art needs ComfyUI open; `--art` isn't needed.
 - For a double-faced card, each face's PNG reproduces just that face.
@@ -125,14 +125,18 @@ with a quantity if you like) and it is rebuilt exactly from its embedded metadat
 ## Your own art
 Add `[image: path]` to a card to use an image file as its art (no ComfyUI needed):
 ```
-.venv\Scripts\python.exe -m proxygen "Forest [full] [image: C:\pics\forest.jpg]"
-.venv\Scripts\python.exe -m proxygen "Island [image: pics/island.png | fit]"
+.venv\Scripts\python.exe -m slopxy "Forest [full] [image: C:\pics\forest.jpg]"
+.venv\Scripts\python.exe -m slopxy "Island [image: pics/island.png | fit]"
 ```
 - When the image's shape doesn't match the art window: `crop` (default) fills the window and
   trims the overflow; `fit` shows the whole image over a blurred fill. Set it per card with
   `| crop` / `| fit`, or for all cards with `--art-fit`.
 - The image path is stored in the PNG metadata, so the card can be reproduced while the file
   still exists.
-- Workflows live in `proxygen/workflows/*.json` (ComfyUI API format, core nodes only).
+- Workflows live in `slopxy/workflows/*.json` (ComfyUI API format, core nodes only).
 
 Requires Pillow (`pip install -r requirements.txt`).
+
+## License
+Public domain, under the [Unlicense](LICENSE). Magic: The Gathering card names and rules text
+come from the Scryfall data file you download; they are not part of this repository.

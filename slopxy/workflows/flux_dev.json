@@ -16,5 +16,5 @@
   "6": {"class_type": "VAEDecode", "_meta": {"title": "Decode"},
         "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
   "7": {"class_type": "SaveImage", "_meta": {"title": "Save"},
-        "inputs": {"images": ["6", 0], "filename_prefix": "proxygen/art"}}
+        "inputs": {"images": ["6", 0], "filename_prefix": "slopxy/art"}}
 }

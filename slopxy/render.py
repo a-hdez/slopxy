@@ -398,19 +398,21 @@ def render_card(card: dict, printing: dict, full_art: bool = False) -> list[Rend
     return [Rendered("", *render_standard(_face(card, card, printing, None), printing))]
 
 
-META_KEY = "proxygen"  # PNG iTXt chunk holding the JSON needed to reproduce the image
+META_KEY = "slopxy"  # PNG iTXt chunk holding the JSON needed to reproduce the image
+OLD_META_KEYS = ("proxygen",)  # read from images made before the rename
 
 
 def save(img: Image.Image, path, meta: dict | None = None) -> None:
     info = PngImagePlugin.PngInfo()
-    info.add_text("Software", "proxygen")
+    info.add_text("Software", "slopxy")
     if meta is not None:
         info.add_itxt(META_KEY, json.dumps(meta, ensure_ascii=False))
     img.save(path, dpi=(DPI, DPI), pnginfo=info)
 
 
 def read_meta(path) -> dict | None:
-    """The proxygen metadata embedded in an output PNG, or None."""
+    """The slopxy metadata embedded in an output PNG, or None."""
     with Image.open(path) as im:
-        raw = getattr(im, "text", {}).get(META_KEY)
+        text = getattr(im, "text", {})
+        raw = next((text[k] for k in (META_KEY, *OLD_META_KEYS) if k in text), None)
     return json.loads(raw) if raw else None

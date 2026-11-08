@@ -1,0 +1,12 @@
+{
+  "1": {"class_type": "CLIPLoader", "_meta": {"title": "Language model (text encoder)"},
+        "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}},
+  "2": {"class_type": "TextGenerate", "_meta": {"title": "Write scene description"},
+        "inputs": {"clip": ["1", 0], "prompt": "", "max_length": 320,
+                   "sampling_mode": "on", "sampling_mode.temperature": 0.8,
+                   "sampling_mode.top_k": 64, "sampling_mode.top_p": 0.95,
+                   "sampling_mode.min_p": 0.05, "sampling_mode.repetition_penalty": 1.05,
+                   "sampling_mode.seed": 0, "thinking": false}},
+  "3": {"class_type": "PreviewAny", "_meta": {"title": "Description"},
+        "inputs": {"source": ["2", 0]}}
+}

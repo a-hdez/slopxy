@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Card data (Scryfall bulk files are ~650 MB; download your own, see README)
+*.jsonl
+.cache/
+
+# Generated output
+output/
+art/
+*.pdf
+
+# Editor / machine-specific
+.vscode/
+.idea/
+.ipynb_checkpoints/

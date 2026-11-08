@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:ev="http://www.w3.org/2001/xml-events" xmlns:xlink="http://www.w3.org/1999/xlink" baseProfile="full" height="512" version="1.1" viewBox="0 0 512 512" width="512">
+  <defs/>
+  <circle cx="256.0" cy="256.0" fill="#4d5d68" r="248"/>
+  <g transform="translate(-5.16 -5.16) scale(1.0201)">
+    <path d="M 256,48 L 396,256 L 256,464 L 116,256 Z M 256,90.9817616756 L 367.069968103,256 L 256,421.018238324 L 144.930031897,256 Z" fill="#000000" fill-rule="evenodd"/>
+  </g>
+</svg>

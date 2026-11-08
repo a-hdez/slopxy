@@ -1,0 +1,22 @@
+{
+  "1": {"class_type": "UNETLoader", "_meta": {"title": "Diffusion model"},
+        "inputs": {"unet_name": "krea2_turbo_int8_convrot.safetensors", "weight_dtype": "default"}},
+  "9": {"class_type": "CLIPLoader", "_meta": {"title": "Text encoder"},
+        "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}},
+  "10": {"class_type": "VAELoader", "_meta": {"title": "VAE"},
+         "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+  "2": {"class_type": "CLIPTextEncode", "_meta": {"title": "Positive"},
+        "inputs": {"clip": ["9", 0], "text": ""}},
+  "3": {"class_type": "ConditioningZeroOut", "_meta": {"title": "Negative"},
+        "inputs": {"conditioning": ["2", 0]}},
+  "4": {"class_type": "EmptyLatentImage", "_meta": {"title": "Size"},
+        "inputs": {"width": 1216, "height": 832, "batch_size": 1}},
+  "5": {"class_type": "KSampler", "_meta": {"title": "Sampler"},
+        "inputs": {"model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                   "latent_image": ["4", 0], "seed": 0, "steps": 8, "cfg": 1.0,
+                   "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
+  "6": {"class_type": "VAEDecode", "_meta": {"title": "Decode"},
+        "inputs": {"samples": ["5", 0], "vae": ["10", 0]}},
+  "7": {"class_type": "SaveImage", "_meta": {"title": "Save"},
+        "inputs": {"images": ["6", 0], "filename_prefix": "proxygen/art"}}
+}

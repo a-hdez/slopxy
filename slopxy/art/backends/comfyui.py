@@ -1,18 +1,45 @@
-"""Minimal ComfyUI HTTP API client (stdlib only)."""
+"""ComfyUI backend: a minimal HTTP API client (stdlib only), the model presets, and the image
+and text backends that fill in the workflow templates in workflows/."""
 
 from __future__ import annotations
 
+import copy
+import io
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
+
+from PIL import Image
+
+from . import ArtError
 
 DEFAULT_URL = "http://127.0.0.1:8189"  # ComfyUI Desktop's default port
+WORKFLOW_DIR = Path(__file__).parent / "workflows"
+
+PRESETS = {
+    # Krea 2 follows prompts literally, renders quoted text and ignores negatives (cfg 1),
+    # so it gets plain-language style, no flavor quotes and no "card" wording.
+    "krea2-turbo": {"workflow": "krea2_turbo.json",
+                    "checkpoint": "krea2_turbo_int8_convrot.safetensors",
+                    "style": ("epic fantasy digital painting, full-bleed illustration filling the "
+                              "entire image, dramatic lighting, highly detailed. The image contains "
+                              "no text, no letters, no border and no frame"),
+                    "flavor": False},
+    "sdxl-turbo": {"workflow": "sdxl_turbo.json",
+                   "checkpoint": "dreamshaperXL_v21TurboDPMSDE.safetensors"},
+    "flux": {"workflow": "flux_dev.json", "checkpoint": "flux1-dev-fp8.safetensors"},
+}
+DEFAULT_MODEL = "krea2-turbo"
+
+# Model loader node -> the input that names the model file (node "1" in every workflow).
+LOADER_INPUT = {"CheckpointLoaderSimple": "ckpt_name", "UNETLoader": "unet_name"}
 
 
-class ComfyError(RuntimeError):
+class ComfyError(ArtError):
     pass
 
 
@@ -95,3 +122,61 @@ class ComfyClient:
                     return entry.get("outputs", {})
             time.sleep(1.0)
         raise ComfyError(f"Timed out after {self.timeout:.0f}s waiting for ComfyUI.")
+
+
+def _load_workflow(name: str) -> dict:
+    return json.loads((WORKFLOW_DIR / name).read_text())
+
+
+class ComfyImageBackend:
+    """Image generation with one model preset. The workflow's node ids are fixed: "1" loads
+    the model, "2"/"3" are the positive/negative prompts, "4" the latent size, "5" the sampler."""
+
+    def __init__(self, client: ComfyClient, model: str = DEFAULT_MODEL,
+                 checkpoint: str | None = None):
+        self.client = client
+        self.model = model
+        preset = PRESETS[model]
+        self.style = preset.get("style")
+        self.flavor = preset.get("flavor", True)
+        self.template = _load_workflow(preset["workflow"])
+        self.loader = self.template["1"]["class_type"]
+        self.loader_input = LOADER_INPUT[self.loader]
+        self.checkpoint = self._resolve_checkpoint(checkpoint or preset["checkpoint"])
+
+    def _resolve_checkpoint(self, wanted: str) -> str:
+        available = self.client.model_files(self.loader, self.loader_input)
+        key = wanted.lower().replace("\\", "/")
+        for name in available:
+            n = name.lower().replace("\\", "/")
+            if n == key or n.rsplit("/", 1)[-1] == key.rsplit("/", 1)[-1]:
+                return name
+        raise ComfyError(f"Model '{wanted}' not found by ComfyUI's {self.loader}. Available: "
+                         + ", ".join(available))
+
+    def generate(self, spec: dict) -> Image.Image:
+        wf = copy.deepcopy(self.template)
+        wf["1"]["inputs"][self.loader_input] = spec["checkpoint"]
+        wf["2"]["inputs"]["text"] = spec["positive"]
+        if wf["3"]["class_type"] == "CLIPTextEncode":
+            wf["3"]["inputs"]["text"] = spec["negative"]
+        wf["4"]["inputs"]["width"], wf["4"]["inputs"]["height"] = spec["width"], spec["height"]
+        wf["5"]["inputs"]["seed"] = spec["seed"]
+        img = Image.open(io.BytesIO(self.client.run(wf)))
+        img.load()
+        return img
+
+
+class ComfyTextBackend:
+    """The language model behind scene descriptions: Qwen3-VL through ComfyUI's Generate Text
+    node (workflows/describe.json)."""
+
+    def __init__(self, client: ComfyClient):
+        self.client = client
+        self.template = _load_workflow("describe.json")
+
+    def complete(self, prompt: str, seed: int) -> str:
+        wf = copy.deepcopy(self.template)
+        wf["2"]["inputs"]["prompt"] = prompt
+        wf["2"]["inputs"]["sampling_mode.seed"] = seed
+        return self.client.run_text(wf)

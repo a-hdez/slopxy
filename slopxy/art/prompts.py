@@ -1,42 +1,11 @@
-"""AI art: prompt building, ComfyUI generation and compositing."""
+"""Prompt text for AI art: template prompts, basic-land landscapes, the scene-description
+instruction for the language model, and per-run variation hints. No backend code here."""
 
 from __future__ import annotations
 
-import copy
-import io
-import json
-import math
 import random
 import re
 from pathlib import Path
-
-from PIL import Image, ImageFilter, ImageOps
-
-from .comfy import ComfyClient, ComfyError
-
-WORKFLOW_DIR = Path(__file__).parent / "workflows"
-
-PRESETS = {
-    # Krea 2 follows prompts literally, renders quoted text and ignores negatives (cfg 1),
-    # so it gets plain-language style, no flavor quotes and no "card" wording.
-    "krea2-turbo": {"workflow": "krea2_turbo.json",
-                    "checkpoint": "krea2_turbo_int8_convrot.safetensors",
-                    "style": ("epic fantasy digital painting, full-bleed illustration filling the "
-                              "entire image, dramatic lighting, highly detailed. The image contains "
-                              "no text, no letters, no border and no frame"),
-                    "flavor": False},
-    "sdxl-turbo": {"workflow": "sdxl_turbo.json",
-                   "checkpoint": "dreamshaperXL_v21TurboDPMSDE.safetensors"},
-    "flux": {"workflow": "flux_dev.json", "checkpoint": "flux1-dev-fp8.safetensors"},
-}
-DEFAULT_MODEL = "krea2-turbo"
-
-# Model loader node -> the input that names the model file (node "1" in every workflow).
-LOADER_INPUT = {"CheckpointLoaderSimple": "ckpt_name", "UNETLoader": "unet_name"}
-
-# SDXL/Flux-friendly resolutions (~1 megapixel)
-BUCKETS = [(1024, 1024), (1152, 896), (1216, 832), (1344, 768), (1536, 640),
-           (896, 1152), (832, 1216), (768, 1344), (640, 1536)]
 
 STYLE = ("fantasy illustration, trading card game art, detailed digital painting, "
          "dramatic lighting, highly detailed")
@@ -281,50 +250,22 @@ def card_brief(face) -> str:
     return "\n".join(lines)
 
 
-def _clean_description(text: str) -> str:
+def clean_description(text: str) -> str:
+    """Tidy the language model's output into a single-paragraph description."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"^\s*(description|scene|prompt)\s*:\s*", "", text.strip(), flags=re.I)
     return " ".join(text.split()).strip(" \"\u201c\u201d")
 
 
-# ---------------------------------------------------------------- geometry / compositing
-
-FIT_MODES = ("crop", "fit")
-
-
-def bucket_for(w: float, h: float) -> tuple[int, int]:
-    target = math.log(w / h)
-    return min(BUCKETS, key=lambda b: abs(math.log(b[0] / b[1]) - target))
-
-
-def fit_art(art: Image.Image, size: tuple[int, int], mode: str = "crop") -> Image.Image:
-    """Size art to a window. crop: fill the window, trimming the overflow (centered).
-    fit: show the whole image, filling the leftover space with a blurred, darkened copy."""
-    art = art.convert("RGBA")
-    cover = ImageOps.fit(art, size, Image.LANCZOS)
-    if mode != "fit":
-        return cover
-    bg = cover.filter(ImageFilter.GaussianBlur(max(size) / 30))
-    bg = Image.blend(bg, Image.new("RGBA", size, (0, 0, 0, 255)), 0.35)
-    inner = ImageOps.contain(art, size, Image.LANCZOS)
-    bg.alpha_composite(inner, ((size[0] - inner.width) // 2, (size[1] - inner.height) // 2))
-    return bg
-
-
-def compose(card: Image.Image, layers: list[tuple[Image.Image, tuple, str]]) -> Image.Image:
-    """Put each art image under the card at its window rect: [(art, rect, fit_mode), ...]."""
-    base = Image.new("RGBA", card.size, (0, 0, 0, 0))
-    for art, rect, mode in layers:
-        x0, y0, x1, y1 = (int(round(v)) for v in rect)
-        base.paste(fit_art(art, (x1 - x0 + 1, y1 - y0 + 1), mode), (x0, y0))
-    base.alpha_composite(card)
-    return base
-
-
-def load_image_art(path: str | Path) -> Image.Image:
-    img = Image.open(path)
-    img.load()
-    return img
+def describe_prompt(face, hint: str | None = None) -> str:
+    """The instruction sent to the language model to write a scene description for a face."""
+    land = basic_land_type(face)
+    if land:
+        return LAND_INSTRUCTION.format(
+            land=f"a {land.lower()} landscape" if land != "Wastes" else "a barren wasteland",
+            scene=hint or land_hints(face, 1)[0], rule=LAND_RULES[land])
+    return DESCRIBE_INSTRUCTION + card_brief(face) + (
+        f"\n\nFor this image: {hint}" if hint else "")
 
 
 # Directions that push several runs of the same card toward different scenes.
@@ -343,112 +284,3 @@ def variation_hints(n: int, face=None) -> list[str]:
     picks += random.choices(combos, k=n - len(picks))
     return [f"Show it from {v}, {c}. Choose a subject or composition different from the most "
             "obvious one." for v, c in picks]
-
-
-def new_seed() -> int:
-    return random.randrange(2**32)
-
-
-# ---------------------------------------------------------------- generator
-
-class ArtGenerator:
-    """Generates art with one model preset. Nothing is cached: every call to plan() picks a
-    seed (random unless fixed) and the resulting spec is stored in the output PNG instead."""
-
-    def __init__(self, client: ComfyClient, model: str = DEFAULT_MODEL,
-                 checkpoint: str | None = None, seed: int | None = None,
-                 describe: bool = True, log=print):
-        self.client = client
-        self.preset = PRESETS[model]
-        self.model = model
-        self.seed = seed
-        self.log = log
-        self.template = json.loads((WORKFLOW_DIR / self.preset["workflow"]).read_text())
-        self.loader = self.template["1"]["class_type"]
-        self.loader_input = LOADER_INPUT[self.loader]
-        self.checkpoint = self._resolve_checkpoint(checkpoint or self.preset["checkpoint"])
-        self.describe = describe
-        self.describe_template = json.loads((WORKFLOW_DIR / "describe.json").read_text())
-
-    def _resolve_checkpoint(self, wanted: str) -> str:
-        available = self.client.model_files(self.loader, self.loader_input)
-        key = wanted.lower().replace("\\", "/")
-        for name in available:
-            n = name.lower().replace("\\", "/")
-            if n == key or n.rsplit("/", 1)[-1] == key.rsplit("/", 1)[-1]:
-                return name
-        raise ComfyError(f"Model '{wanted}' not found by ComfyUI's {self.loader}. Available: "
-                         + ", ".join(available))
-
-    def _seed(self) -> int:
-        return self.seed if self.seed is not None else new_seed()
-
-    def prompt_for(self, face, override: str | None = None, label: str = "",
-                   hint: str | None = None) -> tuple[str, str, dict]:
-        """(positive, negative, info): user override, else an LLM scene description,
-        else the template prompt. info records where the prompt came from."""
-        style = self.preset.get("style", STYLE)
-        info = {"prompt_source": "custom" if override else "template"}
-        if not override and self.describe:
-            if hint is None and basic_land_type(face):
-                hint = land_hints(face, 1)[0]
-            try:
-                override = self.describe_face(face, label, hint)
-                info = {"prompt_source": "description", "description": override}
-                if hint:
-                    info["direction"] = hint
-            except ComfyError as e:
-                self.log(f"  scene description failed ({e}); using the template prompt. "
-                         "Pass --no-describe to skip this step.")
-                self.describe = False
-        positive, negative = build_prompt(face, override, style, self.preset.get("flavor", True))
-        return positive, negative, info
-
-    def describe_face(self, face, label: str = "", hint: str | None = None) -> str:
-        """Scene description written by the language model (random seed unless --seed)."""
-        wf = copy.deepcopy(self.describe_template)
-        land = basic_land_type(face)
-        if land:
-            wf["2"]["inputs"]["prompt"] = LAND_INSTRUCTION.format(
-                land=f"a {land.lower()} landscape" if land != "Wastes" else "a barren wasteland",
-                scene=hint or land_hints(face, 1)[0], rule=LAND_RULES[land])
-        else:
-            wf["2"]["inputs"]["prompt"] = DESCRIBE_INSTRUCTION + card_brief(face) + (
-                f"\n\nFor this image: {hint}" if hint else "")
-        wf["2"]["inputs"]["sampling_mode.seed"] = self._seed()
-        self.log(f"  describing scene for {label or face.name}...")
-        text = _clean_description(self.client.run_text(wf))
-        if not text:
-            raise ComfyError("the language model returned an empty description")
-        return text
-
-    def plan(self, face, rect, override: str | None = None, label: str = "",
-             hint: str | None = None) -> dict:
-        """Everything needed to generate (and later reproduce) art for one window."""
-        positive, negative, info = self.prompt_for(face, override, label, hint)
-        w, h = bucket_for(rect[2] - rect[0], rect[3] - rect[1])
-        return {"source": "generated", "model": self.model, "checkpoint": self.checkpoint,
-                "positive": positive, "negative": negative, "seed": self._seed(),
-                "width": w, "height": h, **info}
-
-    def restyle(self, spec: dict, face, label: str = "", hint: str | None = None) -> dict:
-        """A copy of spec with a fresh scene description (for --redescribe)."""
-        description = self.describe_face(face, label, hint)
-        positive, negative = build_prompt(face, description, self.preset.get("style", STYLE),
-                                          self.preset.get("flavor", True))
-        return {**spec, "positive": positive, "negative": negative,
-                "prompt_source": "description", "description": description}
-
-    def generate(self, spec: dict, label: str = "") -> Image.Image:
-        wf = copy.deepcopy(self.template)
-        wf["1"]["inputs"][self.loader_input] = spec["checkpoint"]
-        wf["2"]["inputs"]["text"] = spec["positive"]
-        if wf["3"]["class_type"] == "CLIPTextEncode":
-            wf["3"]["inputs"]["text"] = spec["negative"]
-        wf["4"]["inputs"]["width"], wf["4"]["inputs"]["height"] = spec["width"], spec["height"]
-        wf["5"]["inputs"]["seed"] = spec["seed"]
-        self.log(f"  generating art for {label} ({spec['width']}x{spec['height']}, "
-                 f"{spec['model']}, seed {spec['seed']})...")
-        img = Image.open(io.BytesIO(self.client.run(wf)))
-        img.load()
-        return img

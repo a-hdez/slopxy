@@ -10,11 +10,15 @@ Phyrexian). Hybrid costs combine two badges on a split circle. Generic numbers, 
 are still drawn by `slopxy/symbols.py`.
 
 ## Setup
-Requires Python 3.10+.
+Requires Python 3.10+. From the repository folder:
 ```
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\activate
+pip install -e .
 ```
+This installs the `slopxy` command (in the venv; activate it in each new terminal). Without
+activating, run `.venv\Scripts\slopxy.exe` or `.venv\Scripts\python.exe -m slopxy` instead.
+
 Download the **Default Cards** bulk file from https://scryfall.com/docs/api/bulk-data and put
 the `default-cards-*.jsonl` file in the folder you run slopxy from (or pass `--data PATH`).
 It is not in the repository because of its size (~650 MB).
@@ -24,9 +28,9 @@ DejaVu are used as fallbacks, so cards look slightly different on other systems.
 
 ## Usage
 ```
-.venv\Scripts\python.exe -m slopxy "Lightning Bolt" "Fire // Ice"
-.venv\Scripts\python.exe -m slopxy -f decklist.txt -o output
-.venv\Scripts\python.exe -m slopxy            # interactive: type names, blank line to finish
+slopxy "Lightning Bolt" "Fire // Ice"
+slopxy -f decklist.txt -o output
+slopxy            # interactive: type names, blank line to finish
 ```
 
 - `Name|SET` picks a specific printing (e.g. `Lightning Bolt|M10`); otherwise the latest
@@ -50,9 +54,9 @@ DejaVu are used as fallbacks, so cards look slightly different on other systems.
 ## Printable sheets
 Add `--sheet` to get a print-ready multi-page PDF (quantities honored) instead of single images:
 ```
-.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet
-.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet --paper a4 --cut-lines marks
-.venv\Scripts\python.exe -m slopxy -f decklist.txt --sheet --art --sheet-name modern.pdf
+slopxy -f decklist.txt --sheet
+slopxy -f decklist.txt --sheet --paper a4 --cut-lines marks
+slopxy -f decklist.txt --sheet --art --sheet-name modern.pdf
 ```
 - Cards are true size (2.5×3.5in); print at **100% / actual size**, not "fit to page".
 - `--paper letter|a4|legal|a3|tabloid` or custom `210x297mm` / `8.5x11in` (default letter).
@@ -67,8 +71,8 @@ Add `--sheet` to get a print-ready multi-page PDF (quantities honored) instead o
 ## AI art (ComfyUI)
 Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--art`:
 ```
-.venv\Scripts\python.exe -m slopxy --art "Lightning Bolt" "Sol Ring [full]"
-.venv\Scripts\python.exe -m slopxy --art -f decklist.txt --prompts prompts.txt
+slopxy --art "Lightning Bolt" "Sol Ring [full]"
+slopxy --art -f decklist.txt --prompts prompts.txt
 ```
 - Prompts: before each image, the Qwen3-VL language model (the Krea 2 text encoder, run
   through ComfyUI's built-in Generate Text node) reads the card's name, type, colors, rules
@@ -79,7 +83,7 @@ Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--a
   of `Card Name = prompt` lines (face names work for double-faced/split cards).
 - Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, and snow-covered ones) are
   always pure landscapes. Each image picks a scene from a catalog for its land type
-  (`LAND_SCENES` in `slopxy/art.py`), plus a time of day or weather. Forests are seen from
+  (`LAND_SCENES` in `slopxy/art/prompts.py`), plus a time of day or weather. Forests are seen from
   above, from afar or from under the canopy; Islands show real coastlines and islands;
   Mountains show ranges, volcanoes and lone peaks; Swamps are dead, drowned bogs. The prompt
   bans people, buildings, ruins, carvings, runes and magic effects. With `--runs`, each run
@@ -100,8 +104,8 @@ Open ComfyUI Desktop first (it serves on `http://127.0.0.1:8189`), then add `--a
 `--runs N` generates art N times for every card, one image per run; `[runs: N]` does it for
 one line of a list:
 ```
-.venv\Scripts\python.exe -m slopxy --art "Forest [full]" --runs 10
-.venv\Scripts\python.exe -m slopxy --art "Forest [full] [runs: 10]" "Sol Ring"
+slopxy --art "Forest [full]" --runs 10
+slopxy --art "Forest [full] [runs: 10]" "Sol Ring"
 ```
 - Each run gets its own scene description and seed, saved as `Forest (full art).png`,
   `Forest (full art) (1).png`, ... (with `--overwrite`, runs still never replace each other).
@@ -115,9 +119,9 @@ one line of a list:
 Give a slopxy output PNG instead of a card name (on the command line or in a list file,
 with a quantity if you like) and it is rebuilt exactly from its embedded metadata:
 ```
-.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png"
-.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png" --new-seed     # same scene, new image
-.venv\Scripts\python.exe -m slopxy "output/Sol Ring.png" --redescribe   # new scene, same seed
+slopxy "output/Sol Ring.png"
+slopxy "output/Sol Ring.png" --new-seed     # same scene, new image
+slopxy "output/Sol Ring.png" --redescribe   # new scene, same seed
 ```
 - `--seed N` sets the seed explicitly. Generated art needs ComfyUI open; `--art` isn't needed.
 - For a double-faced card, each face's PNG reproduces just that face.
@@ -125,17 +129,18 @@ with a quantity if you like) and it is rebuilt exactly from its embedded metadat
 ## Your own art
 Add `[image: path]` to a card to use an image file as its art (no ComfyUI needed):
 ```
-.venv\Scripts\python.exe -m slopxy "Forest [full] [image: C:\pics\forest.jpg]"
-.venv\Scripts\python.exe -m slopxy "Island [image: pics/island.png | fit]"
+slopxy "Forest [full] [image: C:\pics\forest.jpg]"
+slopxy "Island [image: pics/island.png | fit]"
 ```
 - When the image's shape doesn't match the art window: `crop` (default) fills the window and
   trims the overflow; `fit` shows the whole image over a blurred fill. Set it per card with
   `| crop` / `| fit`, or for all cards with `--art-fit`.
 - The image path is stored in the PNG metadata, so the card can be reproduced while the file
   still exists.
-- Workflows live in `slopxy/workflows/*.json` (ComfyUI API format, core nodes only).
+- Workflows live in `slopxy/art/backends/workflows/*.json` (ComfyUI API format, core nodes
+  only). The ComfyUI-specific code is `slopxy/art/backends/comfyui.py`; other generation
+  setups can be added as backends next to it (see `slopxy/art/backends/__init__.py`).
 
-Requires Pillow (`pip install -r requirements.txt`).
 
 ## License
 Public domain, under the [Unlicense](LICENSE). Magic: The Gathering card names and rules text

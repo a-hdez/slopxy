@@ -8,10 +8,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .art import (DEFAULT_MODEL, FIT_MODES, PRESETS, ArtGenerator, compose, load_image_art,
-                  load_prompt_file, new_seed, variation_hints)
+from .art import (FIT_MODES, ArtError, ArtGenerator, compose, load_image_art, load_prompt_file,
+                  new_seed, variation_hints)
+from .art.backends.comfyui import (DEFAULT_MODEL, DEFAULT_URL, PRESETS, ComfyClient,
+                                   ComfyImageBackend, ComfyTextBackend)
 from .carddb import CardDB, find_data_file
-from .comfy import DEFAULT_URL, ComfyClient, ComfyError
 from .render import read_meta, render_card, save
 from .sheets import PAPER_SIZES, SheetOptions, build_pages, compute_layout, save_pdf
 
@@ -134,7 +135,8 @@ class ArtContext:
         key = (model, checkpoint)
         if key not in self.gens:
             self.connect()
-            self.gens[key] = ArtGenerator(self.client, model, checkpoint, seed=self.args.seed,
+            self.gens[key] = ArtGenerator(ComfyImageBackend(self.client, model, checkpoint),
+                                          ComfyTextBackend(self.client), seed=self.args.seed,
                                           describe=not self.args.no_describe)
         return self.gens[key]
 
@@ -250,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             ctx.connect()
             if args.art:
                 ctx.gen(args.art_model, args.checkpoint)  # validate the model up front
-        except ComfyError as e:
+        except ArtError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 3
 
@@ -415,7 +417,7 @@ def _compose_run(e, r, stem, card, printing, ctx, prompts, art_failed, args, run
                 art, mode = ctx.gen(spec["model"], spec["checkpoint"]).generate(spec, label), "crop"
             layers.append((art, w.rect, mode))
             art_meta.append({"window": w.key, "face": w.face.name, **spec})
-        except (ComfyError, OSError) as err:
+        except (ArtError, OSError) as err:
             art_failed.append((label, str(err)))
             print(f"  art failed for {label}: {err}", file=sys.stderr)
     if layers:

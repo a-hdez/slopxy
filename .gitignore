@@ -9,11 +9,16 @@ venv/
 .cache/
 
 # Generated output
-output/
-art/
+/output/
+/art/
 *.pdf
 
 # Editor / machine-specific
 .vscode/
 .idea/
 .ipynb_checkpoints/
+
+# Packaging
+*.egg-info/
+build/
+dist/

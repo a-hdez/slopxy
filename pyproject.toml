@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slopxy"
+version = "0.1.0"
+description = "Generate Magic: The Gathering proxy card images, with optional AI art."
+readme = "README.md"
+license = "Unlicense"
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+slopxy = "slopxy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["slopxy*"]
+
+[tool.setuptools.package-data]
+"slopxy" = ["assets/*.svg"]
+"slopxy.art.backends" = ["workflows/*.json"]

@@ -17,8 +17,11 @@ dependencies = [
 [project.scripts]
 slopxy = "slopxy.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["slopxy*"]
+# The repository root is the slopxy package (flat layout), so `import slopxy` needs an install:
+# pip install -e .
+[tool.setuptools]
+packages = ["slopxy", "slopxy.art", "slopxy.art.backends"]
+package-dir = {"slopxy" = "."}
 
 [tool.setuptools.package-data]
 "slopxy" = ["assets/*.svg"]

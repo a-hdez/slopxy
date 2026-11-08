@@ -10,7 +10,6 @@ venv/
 
 # Generated output
 /output/
-/art/
 *.pdf
 
 # Editor / machine-specific

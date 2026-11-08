@@ -5,9 +5,9 @@ local Scryfall bulk file `default-cards-*.jsonl`. The art window is transparent,
 with AI art from a local ComfyUI (see below).
 
 Mana symbols (in the title bar and in rules text) use the badges in
-`slopxy/assets/*_badge.svg` (star W, droplet U, skull B, fireball R, tree G, diamond C, phi for
+`assets/*_badge.svg` (star W, droplet U, skull B, fireball R, tree G, diamond C, phi for
 Phyrexian). Hybrid costs combine two badges on a split circle. Generic numbers, X, snow and tap
-are still drawn by `slopxy/symbols.py`.
+are still drawn by `symbols.py`.
 
 ## Setup
 Requires Python 3.10+. From the repository folder:
@@ -18,6 +18,9 @@ pip install -e .
 ```
 This installs the `slopxy` command (in the venv; activate it in each new terminal). Without
 activating, run `.venv\Scripts\slopxy.exe` or `.venv\Scripts\python.exe -m slopxy` instead.
+The repository root is the `slopxy` package itself, so the install step is required:
+`python -m slopxy` does not work from a fresh checkout without it. With `-e`, code edits take
+effect immediately.
 
 Download the **Default Cards** bulk file from https://scryfall.com/docs/api/bulk-data and put
 the `default-cards-*.jsonl` file in the folder you run slopxy from (or pass `--data PATH`).
@@ -83,7 +86,7 @@ slopxy --art -f decklist.txt --prompts prompts.txt
   of `Card Name = prompt` lines (face names work for double-faced/split cards).
 - Basic lands (Plains, Island, Swamp, Mountain, Forest, Wastes, and snow-covered ones) are
   always pure landscapes. Each image picks a scene from a catalog for its land type
-  (`LAND_SCENES` in `slopxy/art/prompts.py`), plus a time of day or weather. Forests are seen from
+  (`LAND_SCENES` in `art/prompts.py`), plus a time of day or weather. Forests are seen from
   above, from afar or from under the canopy; Islands show real coastlines and islands;
   Mountains show ranges, volcanoes and lone peaks; Swamps are dead, drowned bogs. The prompt
   bans people, buildings, ruins, carvings, runes and magic effects. With `--runs`, each run
@@ -137,9 +140,9 @@ slopxy "Island [image: pics/island.png | fit]"
   `| crop` / `| fit`, or for all cards with `--art-fit`.
 - The image path is stored in the PNG metadata, so the card can be reproduced while the file
   still exists.
-- Workflows live in `slopxy/art/backends/workflows/*.json` (ComfyUI API format, core nodes
-  only). The ComfyUI-specific code is `slopxy/art/backends/comfyui.py`; other generation
-  setups can be added as backends next to it (see `slopxy/art/backends/__init__.py`).
+- Workflows live in `art/backends/workflows/*.json` (ComfyUI API format, core nodes
+  only). The ComfyUI-specific code is `art/backends/comfyui.py`; other generation
+  setups can be added as backends next to it (see `art/backends/__init__.py`).
 
 
 ## License

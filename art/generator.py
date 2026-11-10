@@ -54,10 +54,11 @@ class ArtGenerator:
             except ArtDeclined as e:  # this card only: the next one may well work
                 self.log(f"  no scene description for {label or face.name} ({e}); using the "
                          "template prompt")
-            except ArtError as e:
+            except Exception as e:  # noqa: BLE001 - the writer is broken: stop asking it
+                why = str(e) if isinstance(e, ArtError) else f"{type(e).__name__}: {e}"
                 with self._lock:
                     if self.describe:
-                        self.log(f"  scene description failed ({e}); using the template "
+                        self.log(f"  scene description failed ({why}); using the template "
                                  "prompt. Pass --no-describe to skip this step.")
                     self.describe = False
         positive, negative = build_prompt(face, override, self.style, self.flavor)

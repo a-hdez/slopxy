@@ -18,7 +18,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from . import PLAIN_STYLE, SD_SIZES, ArtError, ImageCaps
+from . import PLAIN_STYLE, SD_SIZES, ArtError, ArtUnavailable, ImageCaps
 
 DEFAULT_URL = "http://127.0.0.1:8189"  # ComfyUI Desktop's default port
 WORKFLOW_DIR = Path(__file__).parent / "workflows"
@@ -43,6 +43,10 @@ class ComfyError(ArtError):
     pass
 
 
+class ComfyUnreachable(ComfyError, ArtUnavailable):
+    pass
+
+
 class ComfyClient:
     def __init__(self, url: str = DEFAULT_URL, timeout: float = 600):
         self.url = url.rstrip("/")
@@ -60,7 +64,7 @@ class ComfyClient:
         try:
             return self._get_json("/system_stats", timeout=5)
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise ComfyError(
+            raise ComfyUnreachable(
                 f"ComfyUI is not reachable at {self.url} ({e}). "
                 "Open ComfyUI Desktop and retry, or pass --comfy-url."
             ) from None

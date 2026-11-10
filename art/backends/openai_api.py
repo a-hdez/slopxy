@@ -22,7 +22,7 @@ import urllib.request
 
 from PIL import Image
 
-from . import PLAIN_STYLE, ArtError, ImageCaps, api_key, require_sdk
+from . import PLAIN_STYLE, ArtError, ArtUnavailable, ImageCaps, api_key, require_sdk
 
 DEFAULT_IMAGE_MODEL = "gpt-image-2.6-sunburst"
 DEFAULT_TEXT_MODEL = "gpt-6.1-terra"
@@ -35,8 +35,8 @@ def _client(settings: dict):
     base_url = settings.get("base_url")
     if not key:
         if not base_url:
-            raise ArtError("the openai backend needs an API key: set OPENAI_API_KEY (or the "
-                           "profile's api_key_env)")
+            raise ArtUnavailable("the openai backend needs an API key: set OPENAI_API_KEY (or "
+                                 "the variable the profile's api_key_env names)")
         key = "not-needed"  # many local OpenAI-compatible servers take any key
     return openai, openai.OpenAI(api_key=key, base_url=base_url,
                                  max_retries=int(settings.get("max_retries", 3)),

@@ -20,12 +20,23 @@ from .generator import ArtGenerator
 # description backend is chosen (local, so nothing is charged without being asked for).
 COMPANION_TEXT = {"comfyui"}
 
+_PRINT_LOCK = threading.Lock()
+
+
+def say(message: str, err: bool = False) -> None:
+    """print() for several threads: one line at a time, never interleaved."""
+    with _PRINT_LOCK:
+        stream = sys.stderr if err else sys.stdout
+        stream.write(f"{message}\n")
+        stream.flush()
+
 
 class ArtSession:
-    def __init__(self, args, config: Config, log=print):
+    def __init__(self, args, config: Config, log=say):
         self.args = args
         self.config = config
         self.log = log
+        self._failed: dict[str, ArtError] = {}
         self._gens: dict[str, ArtGenerator] = {}
         self._texts: dict[str, object] = {}
         self._limits: dict[int, threading.Semaphore] = {}
@@ -38,18 +49,18 @@ class ArtSession:
         if spec is None:  # the run's own backend: command-line overrides apply
             for key, value in (("model", self.args.art_model),
                                ("checkpoint", self.args.checkpoint),
-                               ("url", self.args.art_url)):
+                               ("url", self.args.art_url or self.args.comfy_url)):
                 if value:
                     settings[key] = value
         else:  # reproducing: the spec says what made the image
             settings["model"] = spec.get("model") or settings.get("model")
             if spec.get("checkpoint"):
                 settings["checkpoint"] = spec["checkpoint"]
-            if self.args.art_url:
-                settings["url"] = self.args.art_url
+            if self.args.art_url or self.args.comfy_url:
+                settings["url"] = self.args.art_url or self.args.comfy_url
         return settings
 
-    def _text_settings(self, image_settings: dict) -> dict | None:
+    def _text_settings(self, image_settings: dict, quiet: bool = False) -> dict | None:
         if self.args.no_describe:
             return None
         name = self.args.describe_backend or self.config.describe
@@ -59,11 +70,18 @@ class ArtSession:
                 settings["model"] = self.args.describe_model
             return settings
         if image_settings["backend"] in COMPANION_TEXT:
+            if self.args.describe_model:
+                self.note("describe-model", f"  --describe-model doesn't apply to "
+                          f"{image_settings['backend']}'s own describer; pass "
+                          "--describe-backend to choose another writer")
             return {"backend": image_settings["backend"], "url": image_settings.get("url"),
                     "profile": image_settings.get("profile")}
-        self.note("describe", "  scene descriptions are off for this backend; using template "
-                              "prompts (choose a writer with --describe-backend, e.g. "
-                              "anthropic, openai or gemini)")
+        if not quiet:
+            self.note("describe", "  scene descriptions are off for this backend; using "
+                                  "template prompts (choose a writer with --describe-backend, "
+                                  "e.g. anthropic, openai or gemini)"
+                      + ("; --describe-model needs --describe-backend"
+                         if self.args.describe_model else ""))
         return None
 
     def note(self, key: str, message: str) -> None:
@@ -75,7 +93,8 @@ class ArtSession:
     # ---------- generators ----------
     def main(self) -> ArtGenerator:
         """The generator for --art: --art-backend, else the config's [art] image profile."""
-        name = self.args.art_backend or self.config.image
+        name = self.args.art_backend or self.config.image or (
+            "comfyui" if self.args.comfy_url else None)  # --comfy-url: as before this existed
         if not name:
             raise ArtError("no image backend chosen. Pass --art-backend NAME (" +
                            ", ".join(n for n, b in BACKENDS.items() if b[1]) +
@@ -90,15 +109,23 @@ class ArtSession:
         profile = spec.get("profile")
         name = profile if profile in self.config.profiles and \
             self.config.profiles[profile].get("backend", profile) == backend else backend
-        return self._gen(self._image_settings(name, spec), describe=self.args.redescribe)
+        return self._gen(self._image_settings(name, spec), describe=self.args.redescribe,
+                         quiet=True)
 
-    def _gen(self, settings: dict, describe: bool) -> ArtGenerator:
+    def _gen(self, settings: dict, describe: bool, quiet: bool = False) -> ArtGenerator:
         key = json.dumps([settings, describe], sort_keys=True, default=str)
         with self._lock:
+            if key in self._failed:  # don't knock on a broken backend once per window
+                raise self._failed[key]
             if key not in self._gens:
-                image = image_backend(settings)
-                text_settings = self._text_settings(settings) if describe else None
-                text = self._text(text_settings) if text_settings else None
+                try:
+                    image = image_backend(settings)
+                    text_settings = (self._text_settings(settings, quiet) if describe
+                                     else None)
+                    text = self._text(text_settings) if text_settings else None
+                except ArtError as e:
+                    self._failed[key] = e
+                    raise
                 self._gens[key] = ArtGenerator(image, text, seed=self.args.seed,
                                                describe=text is not None, log=self.log,
                                                profile=settings.get("profile"))
@@ -141,8 +168,10 @@ def ordered(items, fn, workers: int):
             for nxt in islice(it, 1):
                 pending.append((nxt, ex.submit(fn, nxt)))
             yield item, result
-    finally:
-        ex.shutdown(wait=True, cancel_futures=True)
+    except BaseException:  # Ctrl-C or an error: drop queued work, don't wait for it
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
 
 
 CONFIRM_OVER = 20  # paid requests a run may make without asking
@@ -195,8 +224,7 @@ def list_backends(config: Config) -> str:
         lines.append(f"\nConfig: {config.path}")
         lines.append(f"  [art] image = {config.image!r}, describe = {config.describe!r}")
         for name, prof in config.profiles.items():
-            shown = {k: v for k, v in prof.items()}
-            lines.append(f"  profile {name}: {shown}")
+            lines.append(f"  profile {name}: {prof}")  # config refuses anything key-like
     else:
         lines.append("\nNo config file (looked for --config, ./slopxy.toml and the user config).")
     return "\n".join(lines)

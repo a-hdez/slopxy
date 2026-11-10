@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .art import (FIT_MODES, ArtError, compose, load_image_art, load_prompt_file, new_seed,
                   variation_hints)
-from .art.config import load_config
-from .art.session import ArtSession, confirm_paid, list_backends, ordered
+from .art.backends import ArtUnavailable
+from .art.config import Config, load_config
+from .art.session import ArtSession, confirm_paid, list_backends, ordered, say
 from .carddb import CardDB, find_data_file
 from .render import read_meta, render_card, save
 from .sheets import (PAPER_SIZES, SheetOptions, compute_layout, iter_pages, page_count,
@@ -119,6 +122,16 @@ def _interactive() -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        say("Interrupted.", err=True)
+        if threading.active_count() > 1:  # requests still in flight: don't wait for them
+            os._exit(130)
+        return 130
+
+
+def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="slopxy", description="Generate MTG proxy card images.")
     ap.add_argument("cards", nargs="*",
                     help='card names, e.g. "Lightning Bolt", "Lightning Bolt|M10", "Sol Ring [full]", '
@@ -142,8 +155,9 @@ def main(argv: list[str] | None = None) -> int:
                         "sdxl-turbo, flux; openai/gemini: a model id)")
     g.add_argument("--checkpoint", help="model file for comfyui (same family as the preset) or "
                                         "a1111")
-    g.add_argument("--art-url", "--comfy-url", dest="art_url", metavar="URL",
-                   help="address of a local backend (comfyui, a1111)")
+    g.add_argument("--art-url", metavar="URL", help="address of a local backend (comfyui, a1111)")
+    g.add_argument("--comfy-url", metavar="URL",
+                   help="ComfyUI's address; also picks comfyui when no backend is chosen")
     g.add_argument("--describe-backend", metavar="NAME",
                    help="who writes scene descriptions: anthropic, openai, gemini, comfyui, or "
                         "a profile (default: the config's [art] describe; comfyui describes "
@@ -193,13 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.runs < 1:
         ap.error("--runs must be at least 1")
-    try:
-        config = load_config(args.config)
-    except ArtError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 2
     if args.list_backends:
-        print(list_backends(config))
+        try:
+            print(list_backends(load_config(args.config)))
+        except ArtError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
         return 0
 
     data = Path(args.data) if args.data else find_data_file(Path.cwd())
@@ -249,6 +262,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 2
 
+    config = Config()
+    if args.art or any(e.repro for e in entries):  # only art needs the profiles file
+        try:
+            config = load_config(args.config)
+        except ArtError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
     session = ArtSession(args, config)
     prompts = load_prompt_file(args.prompts) if args.prompts else {}
     if args.art:
@@ -269,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             jobs += _jobs(e, card, printing, session, args, prompts)
-        except ArtError as err:  # e.g. the backend that made a reproduced PNG isn't reachable
+        except ArtUnavailable as err:  # e.g. the backend of a reproduced PNG isn't reachable
             print(f"Error: {err}", file=sys.stderr)
             return 3
 
@@ -301,21 +321,23 @@ def main(argv: list[str] | None = None) -> int:
         for stem, img, meta, kept in _compose_job(j, arts, renders, art_failed, args):
             if write_images:
                 target = out / f"{stem}.png"  # never overwrite a file from this same run
+                arts = [k for k, _ in kept]  # the card's name must be free for its art too
                 path = _write(target, lambda p: _save_card(img, p, meta, kept),
-                              args.overwrite and target not in written)
+                              args.overwrite and target not in written,
+                              related=lambda p: [_art_path(p, k) for k in arts])
                 written.append(path)
-                print(f"  wrote {path}  [{j.printing['set']} #{j.printing['collector_number']}]")
+                say(f"  wrote {path}  [{j.printing['set']} #{j.printing['collector_number']}]")
             elif kept:
                 for key, art in kept:  # no card PNG to sit next to: just the art
                     target = out / f"{stem}.art{key}.png"
                     path = _write(target, art.save, args.overwrite and target not in kept_paths)
                     kept_paths.append(path)
-                    print(f"  kept art {path}")
+                    say(f"  kept art {path}")
             if sheet_opts:
                 # Keep only the flattened, sheet-sized copy; the full RGBA image can go.
                 sheet_cards += [prepare_card(img, sheet_lay, sheet_opts)] * j.entry.qty
                 if not write_images:
-                    print(f"  {j.entry.qty} x {stem}")
+                    say(f"  {j.entry.qty} x {stem}")
 
     if written:
         print(f"\n{len(written)} image(s) written to {out.resolve()}")
@@ -365,25 +387,30 @@ def _load_repro(e: Entry, missing: list) -> bool:
     return True
 
 
-def _free_path(path: Path) -> Path:
-    """First of 'Name (1).ext', 'Name (2).ext', ... that doesn't exist yet."""
+def _free_path(path: Path, taken=None) -> Path:
+    """First of 'Name (1).ext', 'Name (2).ext', ... that isn't taken (doesn't exist yet)."""
+    taken = taken or (lambda p: p.exists())
     n = 1
     while True:
         candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
-        if not candidate.exists():
+        if not taken(candidate):
             return candidate
         n += 1
 
 
-def _write(path: Path, writer, overwrite: bool) -> Path:
-    """Write via writer(path) without clobbering existing files (unless overwrite).
+def _write(path: Path, writer, overwrite: bool, related=None) -> Path:
+    """Write via writer(path) without clobbering existing files (unless overwrite); related(p)
+    lists files that writing p also creates, which must be free too.
     If the target is locked (e.g. open in a viewer), fall back to a numbered copy."""
-    if path.exists() and not overwrite:
-        path = _free_path(path)
+    def taken(p: Path) -> bool:
+        return p.exists() or any(q.exists() for q in (related(p) if related else ()))
+
+    if taken(path) and not overwrite:
+        path = _free_path(path, taken)
     try:
         writer(path)
     except PermissionError:
-        alt = _free_path(path)
+        alt = _free_path(path, taken)
         print(f"  {path.name} is in use; writing {alt.name} instead", file=sys.stderr)
         writer(alt)
         path = alt
@@ -397,7 +424,7 @@ class Window:
     face: object
     key: str
     label: str
-    kind: str = "none"       # none | image (a file) | kept (--keep-art file) | new | repro
+    kind: str = "none"  # none | image (a file) | kept (--keep-art file) | new | repro | failed
     spec: dict | None = None
     gen: object = None       # ArtGenerator for new / repro
     override: str | None = None   # custom prompt for new art
@@ -467,7 +494,12 @@ def _decide(e: Entry, w, label, card, session: ArtSession, args, prompts, hint) 
             win.kind, win.spec = "image", spec
             return win
         kept = spec.pop("kept_art", None)
-        changing = args.redescribe or args.new_seed or args.seed is not None or hint is not None
+        backend = spec.get("backend", "comfyui")
+        if args.seed is not None and spec.get("seed") is None:
+            session.note(f"seed:{backend}", f"  --seed doesn't apply to {backend}: it takes no "
+                                            "seed")
+        changing = (args.redescribe or args.new_seed or hint is not None
+                    or (args.seed is not None and spec.get("seed") is not None))
         if kept and not changing:
             path = e.png.parent / kept
             if path.exists():
@@ -475,15 +507,29 @@ def _decide(e: Entry, w, label, card, session: ArtSession, args, prompts, hint) 
                 win.kind, win.spec = "kept", spec
                 return win
             session.note(f"kept:{path}", f"  kept art {path} is missing; generating it again")
-        win.kind, win.spec, win.gen = "repro", spec, session.for_spec(spec)
-        if spec.get("seed") is None and not args.redescribe:
-            backend = spec.get("backend", "comfyui")
+        try:
+            gen = session.for_spec(spec)
+        except ArtUnavailable:
+            raise
+        except ArtError as err:  # e.g. its model file is gone: this card only, as before
+            win.kind, win.spec, win.error = "failed", spec, err
+            return win
+        if args.redescribe and gen.text is None:
+            raise ArtUnavailable("--redescribe needs a scene description writer: pass "
+                                 "--describe-backend (anthropic, openai, gemini, comfyui, ...) "
+                                 "or set describe under [art] in slopxy.toml")
+        win.kind, win.spec, win.gen = "repro", spec, gen
+        if spec.get("seed") is None and not kept and not (
+                args.redescribe or args.new_seed or hint is not None):
             session.note(f"noseed:{backend}", f"  {backend} takes no seed, so reproducing makes "
                                               "a new image from the same prompt (--keep-art "
                                               "keeps art for exact copies)")
         return win
     if args.art:
         win.kind, win.gen = "new", session.main()
+        if args.seed is not None and not win.gen.image.caps.seed:
+            session.note(f"seed:{win.gen.image.name}",
+                         f"  --seed doesn't apply to {win.gen.image.name}: it takes no seed")
         win.override = (e.art_prompt or prompts.get(w.face.name.lower())
                         or prompts.get(card["name"].lower()))
     return win
@@ -554,7 +600,7 @@ def _compose_job(j: Job, arts, renders: dict, art_failed: list, args):
                     art_meta.append({"window": w.key, "face": w.face.name, **spec})
                 except OSError as err:
                     art_failed.append((stem + w.key, str(err)))
-                    print(f"  art failed for {stem + w.key}: {err}", file=sys.stderr)
+                    say(f"  art failed for {stem + w.key}: {err}", err=True)
             img = compose(r.image, layers) if layers else r.image
             yield stem, img, _meta(e, j.card, j.printing, r.suffix, art_meta), []
         return
@@ -569,7 +615,7 @@ def _compose_job(j: Job, arts, renders: dict, art_failed: list, args):
     for w, res in zip(j.windows, arts):
         if isinstance(res, Exception):
             art_failed.append((w.label, _failure(res)))
-            print(f"  art failed for {w.label}: {_failure(res)}", file=sys.stderr)
+            say(f"  art failed for {w.label}: {_failure(res)}", err=True)
             continue
         if res is None:
             continue
@@ -586,6 +632,11 @@ def _compose_job(j: Job, arts, renders: dict, art_failed: list, args):
     yield j.stem, img, _meta(e, j.card, j.printing, r.suffix, art_meta), kept
 
 
+def _art_path(card_png: Path, key: str) -> Path:
+    """Where --keep-art puts a window's art: next to the card, as 'Name.art<window>.png'."""
+    return card_png.with_name(f"{card_png.stem}.art{key}.png")
+
+
 def _meta(e: Entry, card, printing, suffix, art_meta) -> dict:
     return {"version": META_VERSION, "card": card["name"], "set": printing["set"],
             "collector_number": printing["collector_number"], "full_art": e.full_art,
@@ -595,7 +646,7 @@ def _meta(e: Entry, card, printing, suffix, art_meta) -> dict:
 def _save_card(img, path: Path, meta: dict, kept: list) -> None:
     """Save a card PNG; with kept art, also each artwork as '<name>.art<window>.png' next to
     it, recorded (relative to the PNG) in the metadata."""
-    names = {key: f"{path.stem}.art{key}.png" for key, _ in kept}
+    names = {key: _art_path(path, key).name for key, _ in kept}
     if names:
         meta = {**meta, "art": [{**a, "kept_art": names[a["window"]]}
                                 if a["window"] in names else a for a in meta["art"]]}

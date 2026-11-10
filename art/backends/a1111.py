@@ -17,7 +17,7 @@ import urllib.request
 
 from PIL import Image
 
-from . import PLAIN_STYLE, SD_SIZES, ArtError, ImageCaps
+from . import PLAIN_STYLE, SD_SIZES, ArtError, ArtUnavailable, ImageCaps
 
 DEFAULT_URL = "http://127.0.0.1:7860"
 
@@ -46,7 +46,7 @@ class A1111Backend:
             models = self._get("/sdapi/v1/sd-models", timeout=10)
             current = self._get("/sdapi/v1/options", timeout=10).get("sd_model_checkpoint")
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise ArtError(f"the WebUI API is not reachable at {self.url} ({e}). Start "
+            raise ArtUnavailable(f"the WebUI API is not reachable at {self.url} ({e}). Start "
                            "Automatic1111/Forge with --api, or set the profile's url.") from None
         self.checkpoint = self._resolve(settings.get("checkpoint") or settings.get("model")
                                         or current, models)

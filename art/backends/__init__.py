@@ -21,6 +21,10 @@ class ArtError(RuntimeError):
     """A backend could not be reached or failed to produce a result."""
 
 
+class ArtUnavailable(ArtError):
+    """The backend can't be used at all: not reachable, no API key, SDK not installed."""
+
+
 class ArtDeclined(ArtError):
     """The model declined or gave nothing for this one request (a refusal, a blocked or empty
     answer); other requests to the same backend may still work."""
@@ -104,7 +108,7 @@ def image_backend(settings: dict) -> ImageBackend:
     if not BACKENDS.get(name, (None, False))[1]:
         raise ArtError(f"'{name}' can't generate images; image backends: "
                        + ", ".join(n for n, b in BACKENDS.items() if b[1]))
-    return _module(name).image_backend(settings)
+    return _make(_module(name).image_backend, settings)
 
 
 def text_backend(settings: dict) -> TextBackend:
@@ -113,7 +117,15 @@ def text_backend(settings: dict) -> TextBackend:
     if not BACKENDS.get(name, (None, False, False))[2]:
         raise ArtError(f"'{name}' can't write scene descriptions; text backends: "
                        + ", ".join(n for n, b in BACKENDS.items() if b[2]))
-    return _module(name).text_backend(settings)
+    return _make(_module(name).text_backend, settings)
+
+
+def _make(factory, settings: dict):
+    try:
+        return factory(settings)
+    except (ValueError, TypeError) as e:  # e.g. concurrency = "four"
+        raise ArtError(f"profile '{settings.get('profile', settings['backend'])}' has a bad "
+                       f"setting: {e}") from None
 
 
 def require_sdk(module: str, extra: str):
@@ -121,7 +133,8 @@ def require_sdk(module: str, extra: str):
     try:
         return importlib.import_module(module)
     except ImportError:
-        raise ArtError(f"the {extra} backend needs its SDK: pip install slopxy[{extra}]") from None
+        raise ArtUnavailable(f"the {extra} backend needs its SDK: "
+                             f"pip install slopxy[{extra}]") from None
 
 
 def api_key(settings: dict, *default_envs: str) -> str | None:

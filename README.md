@@ -130,7 +130,9 @@ backend (and without a config default) stops and says how to pick one.
     `gemini-3-pro-image`).
   - `--describe-model` does the same for the description writer: `anthropic` defaults to
     `claude-opus-5-5`, `openai` to `gpt-6.1-terra`, `gemini` to `gemini-3.6-flash`.
-- `--art-url` points `comfyui` or `a1111` at another address (`--comfy-url` still works).
+- `--art-url` points `comfyui` or `a1111` at another address. `--comfy-url URL` still works,
+  and picks `comfyui` when no backend is chosen, so `slopxy --art --comfy-url URL ...` runs as
+  it used to.
 - OpenAI and Gemini take no seed, so their images can't be regenerated exactly; keep the
   art itself with `--keep-art` (see Reproducing a card).
 

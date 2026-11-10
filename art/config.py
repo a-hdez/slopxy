@@ -23,13 +23,23 @@ The file is the first of: --config PATH, ./slopxy.toml, the user config file
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .backends import BACKENDS, ArtError
 
-SECRET_KEYS = {"api_key", "key", "token", "password", "secret"}
+_SECRET_NAME = re.compile(r"(^|_)(api_?key|key|token|password|passwd|secret)$", re.I)
+_SECRET_VALUE = re.compile(r"^(sk-|sk_|AIza|xai-|gsk_)")  # common API key prefixes
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _secret_settings(prof: dict) -> list[str]:
+    """Setting names in a profile that look like they hold a secret."""
+    return [k for k, v in prof.items()
+            if k.lower() != "api_key_env" and (_SECRET_NAME.search(k) or (
+                isinstance(v, str) and _SECRET_VALUE.match(v)))]
 
 
 @dataclass
@@ -43,6 +53,9 @@ class Config:
         """Settings for a profile name, or for a backend name with its defaults."""
         if name in self.profiles:
             settings = dict(self.profiles[name])
+            if "backend" not in settings and name not in BACKENDS:
+                raise ArtError(f"profile '{name}' needs a backend = \"...\" line (one of "
+                               f"{', '.join(BACKENDS)})")
             settings.setdefault("backend", name)
         elif name in BACKENDS:
             settings = {"backend": name}
@@ -100,9 +113,14 @@ def load_config(explicit: str | None = None) -> Config:
             isinstance(p, dict) for p in profiles.values()):
         raise ArtError(f"{path}: expected an [art] table and [profiles.NAME] tables")
     for name, prof in profiles.items():
-        leaked = SECRET_KEYS & set(prof)
+        leaked = _secret_settings(prof)
         if leaked:
-            raise ArtError(f"{path}: profile '{name}' has {', '.join(sorted(leaked))}; keep keys "
-                           "out of the file: put the key in an environment variable and set "
-                           "api_key_env to its name")
+            raise ArtError(f"{path}: profile '{name}' seems to hold a key in "
+                           f"{', '.join(sorted(leaked))}; keep keys out of the file: put the "
+                           "key in an environment variable and set api_key_env to its name")
+        env = prof.get("api_key_env")
+        if env is not None and not (isinstance(env, str) and _ENV_NAME.match(env)
+                                    and not _SECRET_VALUE.match(env)):
+            raise ArtError(f"{path}: profile '{name}': api_key_env must be the name of an "
+                           "environment variable (like MY_OPENAI_KEY), not the key itself")
     return Config(path, art.get("image"), art.get("describe"), profiles)

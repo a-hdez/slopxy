@@ -7,6 +7,7 @@ Profile settings:
                or text model (default gemini-3.6-flash)
   api_key_env  env var holding the key (default GOOGLE_API_KEY, then GEMINI_API_KEY)
   base_url     another endpoint for the Gemini API (e.g. a proxy)
+  timeout      seconds per request (default 300)
   image_size   images: "512", "1K" (default), "2K" or "4K"
   thinking_level  text: minimal | low | medium | high (default low for the default model)
   max_tokens   text: output limit (default 4000)
@@ -19,7 +20,7 @@ import io
 
 from PIL import Image
 
-from . import PLAIN_STYLE, ArtDeclined, ArtError, ImageCaps, api_key, require_sdk
+from . import PLAIN_STYLE, ArtDeclined, ArtError, ArtUnavailable, ImageCaps, api_key, require_sdk
 
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_TEXT_MODEL = "gemini-3.6-flash"
@@ -36,10 +37,27 @@ def _client(settings: dict):
     from google.genai import errors
     key = api_key(settings, "GOOGLE_API_KEY", "GEMINI_API_KEY")
     if not key:
-        raise ArtError("the gemini backend needs an API key: set GEMINI_API_KEY (or "
-                       "GOOGLE_API_KEY, or the profile's api_key_env)")
-    options = {"base_url": settings["base_url"]} if settings.get("base_url") else None
-    return errors, genai.Client(api_key=key, http_options=options)
+        raise ArtUnavailable("the gemini backend needs an API key: set GEMINI_API_KEY (or "
+                             "GOOGLE_API_KEY, or the variable the profile's api_key_env names)")
+    options = {"timeout": int(float(settings.get("timeout", 300)) * 1000)}
+    if settings.get("base_url"):
+        options["base_url"] = settings["base_url"]
+    return _errors(errors), genai.Client(api_key=key, http_options=options)
+
+
+def _errors(errors) -> tuple:
+    """Every exception the SDK raises for a failed request: the Interactions client has its
+    own error classes, not subclasses of google.genai.errors.APIError."""
+    found = [errors.APIError]
+    for module, names in (("google.genai._interactions", ("GeminiNextGenAPIClientError",)),
+                          ("google.genai._interactions_continuation",
+                           ("ContinuationTimeoutError",))):
+        try:
+            mod = __import__(module, fromlist=list(names))
+            found += [getattr(mod, n) for n in names if hasattr(mod, n)]
+        except ImportError:
+            pass
+    return tuple(found)
 
 
 def image_backend(settings: dict) -> "GeminiImageBackend":
@@ -87,7 +105,7 @@ class GeminiImageBackend:
         try:
             interaction = self.client.interactions.create(
                 model=spec.get("model", self.model), input=spec["positive"], response_format=fmt)
-        except self.errors.APIError as e:
+        except self.errors as e:
             raise ArtError(f"Gemini image request failed: {e}") from None
         _check(interaction, "image")
         image = getattr(interaction, "output_image", None)
@@ -118,7 +136,7 @@ class GeminiTextBackend:
         try:
             interaction = self.client.interactions.create(model=self.model, input=prompt,
                                                           generation_config=config)
-        except self.errors.APIError as e:
+        except self.errors as e:
             raise ArtError(f"Gemini text request failed: {e}") from None
         _check(interaction, "text")
         return interaction.output_text or ""

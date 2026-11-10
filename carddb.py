@@ -10,7 +10,9 @@ import time
 import unicodedata
 from pathlib import Path
 
-INDEX_VERSION = 2
+import numpy as np
+
+INDEX_VERSION = 3  # 3: stamp ahead of the data; per-set printings in their own file
 
 # Oracle-level fields kept for the card and for each face.
 CARD_FIELDS = (
@@ -61,36 +63,73 @@ def _slim_printing(raw: dict) -> dict:
 
 
 class CardDB:
-    def __init__(self, cards: dict, keys: dict):
+    def __init__(self, cards: dict, keys: dict, sets_loader=None):
         # cards: name -> {"card": {...}, "latest": printing, "sets": {SET: printing}, "token": bool}
         # keys: normalized name/face name -> card name
+        # sets_loader: when the entries come without "sets" (loaded from the cache), a
+        # function returning {name: {SET: printing}}, called the first time a set is needed.
         self.cards = cards
         self.keys = keys
+        self._sets_loader = sets_loader
+        self._chars = None  # per-key character counts for suggest(), built on first use
 
     # ---------- building / loading ----------
+    # The cache is two files, each starting with a stamp so a stale file is detected without
+    # loading the rest: card_index.pkl (cards without their per-set printings, and the
+    # lookup keys) is loaded on every run; card_sets.pkl only for a Name|SET lookup.
     @classmethod
     def load(cls, data_path: Path, rebuild: bool = False, log=print) -> "CardDB":
         data_path = Path(data_path)
-        cache = data_path.parent / ".cache" / "card_index.pkl"
-        st = data_path.stat()
-        stamp = (INDEX_VERSION, data_path.name, st.st_size, int(st.st_mtime))
-        if cache.exists() and not rebuild:
+        index, sets_file = _cache_files(data_path)
+        stamp = _stamp(data_path)
+        if index.exists() and not rebuild:
             try:
-                with open(cache, "rb") as fh:
-                    saved = pickle.load(fh)
-                if saved.get("stamp") == stamp:
-                    return cls(saved["cards"], saved["keys"])
+                with open(index, "rb") as fh:
+                    if pickle.load(fh) == stamp:
+                        saved = pickle.load(fh)
+                        return cls(saved["cards"], saved["keys"],
+                                   sets_loader=lambda: cls._load_sets(data_path, stamp, log))
             except Exception:
                 pass
+        return cls._rebuild(data_path, log)
+
+    @classmethod
+    def _rebuild(cls, data_path: Path, log) -> "CardDB":
         log(f"Building card index from {data_path.name} (one-time, may take a minute)...")
         t0 = time.time()
+        stamp = _stamp(data_path)
         db = cls._build(data_path)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache, "wb") as fh:
-            pickle.dump({"stamp": stamp, "cards": db.cards, "keys": db.keys}, fh,
-                        protocol=pickle.HIGHEST_PROTOCOL)
-        log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {cache}")
+        index, sets_file = _cache_files(data_path)
+        index.parent.mkdir(parents=True, exist_ok=True)
+        slim = {n: {k: v for k, v in e.items() if k != "sets"} for n, e in db.cards.items()}
+        # Sets first: an index is never newer than the sets file next to it.
+        for path, data in ((sets_file, {n: e["sets"] for n, e in db.cards.items()}),
+                           (index, {"cards": slim, "keys": db.keys})):
+            with open(path, "wb") as fh:
+                pickle.dump(stamp, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {index}")
         return db
+
+    @classmethod
+    def _load_sets(cls, data_path: Path, stamp, log) -> dict:
+        """Per-set printings for an index loaded with `stamp`; rebuilds if they're missing."""
+        try:
+            with open(_cache_files(data_path)[1], "rb") as fh:
+                if pickle.load(fh) == stamp:
+                    return pickle.load(fh)
+        except Exception:
+            pass
+        return {n: e["sets"] for n, e in cls._rebuild(data_path, log).cards.items()}
+
+    def _sets_of(self, name: str) -> dict:
+        entry = self.cards[name]
+        if "sets" not in entry and self._sets_loader is not None:
+            loader, self._sets_loader = self._sets_loader, None
+            for n, sets in loader().items():
+                if n in self.cards:
+                    self.cards[n]["sets"] = sets
+        return entry.get("sets", {})
 
     @classmethod
     def _build(cls, data_path: Path) -> "CardDB":
@@ -142,27 +181,68 @@ class CardDB:
         return cls(cards, keys)
 
     # ---------- lookup ----------
+    def suggest(self, key: str, n: int = 5, cutoff: float = 0.75) -> list[str]:
+        """Card names whose keys are close to `key` (difflib), best first.
+        Same result as difflib.get_close_matches over every key, but keys that can't reach
+        the cutoff are dropped first, all at once with numpy: get_close_matches keeps a key
+        only if its quick_ratio, 2 * (characters in common, with multiplicity) / (total
+        length), reaches the cutoff."""
+        if self._chars is None:
+            self._chars = _char_counts(list(self.keys))
+        keys, lengths, alphabet, counts = self._chars
+        codes = np.frombuffer(key.encode("utf-32-le"), dtype=np.uint32)
+        pos = np.searchsorted(alphabet, codes)
+        known = pos < len(alphabet)
+        known[known] = alphabet[pos[known]] == codes[known]
+        query = np.bincount(pos[known], minlength=len(alphabet))
+        common = np.minimum(counts, query).sum(axis=1)
+        total = lengths + len(key)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(total > 0, 2.0 * common / total, 1.0)
+        pool = [keys[i] for i in np.flatnonzero(ratio >= cutoff)]
+        suggestions = []
+        for k in difflib.get_close_matches(key, pool, n=n, cutoff=cutoff):
+            if self.keys[k] not in suggestions:
+                suggestions.append(self.keys[k])
+        return suggestions
+
     def find(self, query: str, set_code: str | None = None):
         """Return (card, printing) or raise LookupError with suggestions."""
         key = normalize(query)
         name = self.keys.get(key)
         if name is None:
-            close = difflib.get_close_matches(key, self.keys.keys(), n=5, cutoff=0.75)
-            suggestions = []
-            for k in close:
-                if self.keys[k] not in suggestions:
-                    suggestions.append(self.keys[k])
-            raise LookupError(suggestions)
+            raise LookupError(self.suggest(key))
         entry = self.cards[name]
         printing = entry["latest"]
         if set_code:
-            printing = entry["sets"].get(set_code.upper())
+            sets = self._sets_of(name)
+            printing = sets.get(set_code.upper())
             if printing is None:
                 raise LookupError(
                     [], f"no English paper printing in set {set_code.upper()} "
-                        f"(available: {', '.join(sorted(entry['sets']))})"
+                        f"(available: {', '.join(sorted(sets))})"
                 )
         return entry["card"], printing
+
+
+def _cache_files(data_path: Path) -> tuple[Path, Path]:
+    cache = data_path.parent / ".cache"
+    return cache / "card_index.pkl", cache / "card_sets.pkl"
+
+
+def _stamp(data_path: Path) -> tuple:
+    st = data_path.stat()
+    return (INDEX_VERSION, data_path.name, st.st_size, int(st.st_mtime))
+
+
+def _char_counts(keys: list[str]):
+    """(keys, key lengths, sorted alphabet of code points, keys x alphabet count matrix)."""
+    lengths = np.fromiter(map(len, keys), dtype=np.int64, count=len(keys))
+    codes = np.frombuffer("".join(keys).encode("utf-32-le"), dtype=np.uint32)
+    alphabet, idx = np.unique(codes, return_inverse=True)
+    owner = np.repeat(np.arange(len(keys)), lengths)
+    counts = np.bincount(owner * len(alphabet) + idx, minlength=len(keys) * len(alphabet))
+    return keys, lengths, alphabet, counts.reshape(len(keys), len(alphabet)).astype(np.uint16)
 
 
 def find_data_file(start: Path) -> Path | None:

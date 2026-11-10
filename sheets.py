@@ -128,25 +128,42 @@ def _crop_marks(d: ImageDraw.ImageDraw, lay: Layout, width: int, n_cards: int):
         d.line([gx1 + 4, y, gx1 + 4 + length, y], fill=MARK_COLOR, width=width)
 
 
-def build_pages(cards: list[Image.Image], opts: SheetOptions) -> tuple[list[Image.Image], Layout]:
-    lay = compute_layout(opts)
-    n_pages = math.ceil(len(cards) / lay.per_page) if cards else 0
+def prepare_card(card: Image.Image, lay: Layout) -> Image.Image:
+    """A card as it goes on the page: resized to the layout's card size and flattened onto
+    white (transparent areas print white). RGB at sheet size is all a sheet needs to keep."""
+    img = card if card.mode == "RGBA" else card.convert("RGBA")
+    if img.size != (lay.card_w, lay.card_h):
+        img = img.resize((lay.card_w, lay.card_h), Image.LANCZOS)
+    flat = Image.new("RGB", img.size, (255, 255, 255))
+    flat.paste(img, (0, 0), img)
+    return flat
+
+
+def page_count(n_cards: int, lay: Layout) -> int:
+    return math.ceil(n_cards / lay.per_page) if n_cards else 0
+
+
+def iter_pages(cards: list[Image.Image], opts: SheetOptions, lay: Layout | None = None):
+    """Yield the sheet pages one at a time, so only one page bitmap needs to be in memory.
+    Cards already passed through prepare_card() are pasted as they are; others are prepared
+    once per distinct image."""
+    lay = lay or compute_layout(opts)
+    n_pages = page_count(len(cards), lay)
     line_w = max(1, round(opts.dpi / 300))
-    pages = []
-    resized: dict[int, Image.Image] = {}
+    prepared: dict[int, Image.Image] = {}
     for p in range(n_pages):
         page = Image.new("RGB", (lay.page_w, lay.page_h), (255, 255, 255))
         d = ImageDraw.Draw(page)
         batch = cards[p * lay.per_page:(p + 1) * lay.per_page]
         for i, card in enumerate(batch):
-            img = resized.get(id(card))
-            if img is None:
-                img = card.convert("RGBA")
-                if img.size != (lay.card_w, lay.card_h):
-                    img = img.resize((lay.card_w, lay.card_h), Image.LANCZOS)
-                resized[id(card)] = img
+            if card.mode == "RGB" and card.size == (lay.card_w, lay.card_h):
+                img = card
+            else:
+                img = prepared.get(id(card))
+                if img is None:
+                    img = prepared[id(card)] = prepare_card(card, lay)
             x, y = lay.slot(i)
-            page.paste(img, (x, y), img)  # alpha onto white: transparent areas print white
+            page.paste(img, (x, y))
             if opts.cut_lines == "lines":
                 d.rectangle([x - line_w, y - line_w, x + lay.card_w - 1 + line_w,
                              y + lay.card_h - 1 + line_w], outline=LINE_COLOR, width=line_w)
@@ -158,9 +175,22 @@ def build_pages(cards: list[Image.Image], opts: SheetOptions) -> tuple[list[Imag
                 f = font("info", max(10, round(opts.dpi * 0.08)))
                 d.text((lay.page_w / 2, lay.page_h - bottom / 2), f"{p + 1} / {n_pages}",
                        font=f, fill=MARK_COLOR, anchor="mm")
-        pages.append(page)
-    return pages, lay
+        yield page
 
 
-def save_pdf(pages: list[Image.Image], path, dpi: int = DPI) -> None:
-    pages[0].save(path, "PDF", save_all=True, append_images=pages[1:], resolution=dpi)
+def build_pages(cards: list[Image.Image], opts: SheetOptions) -> tuple[list[Image.Image], Layout]:
+    """All pages as a list (holds every page in memory; save_pdf(iter_pages(...)) doesn't)."""
+    lay = compute_layout(opts)
+    return list(iter_pages(cards, opts, lay)), lay
+
+
+def save_pdf(pages, path, dpi: int = DPI) -> int:
+    """Write pages (any iterable) to a PDF one page at a time; returns the page count.
+    Pages after the first are appended to the file, so each can be freed once written."""
+    n = 0
+    for page in pages:
+        page.save(path, "PDF", resolution=dpi, append=n > 0)
+        n += 1
+    if n == 0:
+        raise ValueError("no pages to save")
+    return n

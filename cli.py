@@ -14,7 +14,8 @@ from .art.backends.comfyui import (DEFAULT_MODEL, DEFAULT_URL, PRESETS, ComfyCli
                                    ComfyImageBackend, ComfyTextBackend)
 from .carddb import CardDB, find_data_file
 from .render import read_meta, render_card, save
-from .sheets import PAPER_SIZES, SheetOptions, build_pages, compute_layout, save_pdf
+from .sheets import (PAPER_SIZES, SheetOptions, compute_layout, iter_pages, page_count,
+                     prepare_card, save_pdf)
 
 SECTION_HEADERS = {"deck", "sideboard", "commander", "companion", "maybeboard", "mainboard"}
 QTY_RE = re.compile(r"^\s*(\d+)\s*x?\s+", re.IGNORECASE)
@@ -232,13 +233,13 @@ def main(argv: list[str] | None = None) -> int:
         _report_missing(missing)
         return 1 if missing else 0
 
-    sheet_opts = None
+    sheet_opts = sheet_lay = None
     if args.sheet or args.sheet_name:
         sheet_opts = SheetOptions(paper=args.paper, orientation=args.orientation,
                                   margin_in=args.margin, gap_mm=args.gap,
                                   cut_lines=args.cut_lines, card_scale=args.card_scale)
         try:
-            compute_layout(sheet_opts)  # validate paper/margins before doing any work
+            sheet_lay = compute_layout(sheet_opts)  # validate paper/margins before any work
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 2
@@ -276,7 +277,8 @@ def main(argv: list[str] | None = None) -> int:
                 written.append(path)
                 print(f"  wrote {path}  [{printing['set']} #{printing['collector_number']}]")
             if sheet_opts:
-                sheet_cards += [img] * e.qty
+                # Keep only the flattened, sheet-sized copy; the full RGBA image can go.
+                sheet_cards += [prepare_card(img, sheet_lay)] * e.qty
                 if not write_images:
                     print(f"  {e.qty} x {stem}")
 
@@ -291,9 +293,11 @@ def main(argv: list[str] | None = None) -> int:
                 pdf = out / pdf
         else:
             pdf = out / f"{Path(args.file).stem if args.file else 'proxies'}.pdf"
-        pages, lay = build_pages(sheet_cards, sheet_opts)
-        pdf = _write(pdf, lambda p: save_pdf(pages, p), args.overwrite)
-        print(f"\n{len(sheet_cards)} card(s) on {len(pages)} page(s), {lay.cols}x{lay.rows} per page, "
+        lay = sheet_lay
+        n_pages = page_count(len(sheet_cards), lay)
+        pdf = _write(pdf, lambda p: save_pdf(iter_pages(sheet_cards, sheet_opts, lay), p),
+                     args.overwrite)
+        print(f"\n{len(sheet_cards)} card(s) on {n_pages} page(s), {lay.cols}x{lay.rows} per page, "
               f"{sheet_opts.paper} {lay.orientation} -> {pdf.resolve()}")
         print("Print at 100% / actual size (not 'fit to page').")
     for stem, err in art_failed:
@@ -390,7 +394,8 @@ def _card_images(e: Entry, card, printing, ctx: ArtContext, prompts, art_failed,
     generated = args.art or bool(e.repro and any(
         a.get("source") == "generated" for a in e.repro.get("art", [])))
     n_runs = (e.runs or args.runs) if generated and not e.image else 1
-    for r in render_card(card, printing, full_art=e.full_art):
+    only = e.repro.get("suffix", "") if e.repro is not None else None
+    for r in render_card(card, printing, full_art=e.full_art, only=only or None):
         if e.repro is not None and r.suffix != e.repro.get("suffix", ""):
             continue  # reproducing one face of a double-faced card
         stem = f"{safe_filename(card['name'])}{tag}{r.suffix}"

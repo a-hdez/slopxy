@@ -51,7 +51,7 @@ slopxy            # interactive: type names, blank line to finish
 - Existing files are never overwritten: a new copy is written as `Name (1).png`, `Name (2).png`…
   (same for sheet PDFs). Pass `--overwrite` to replace them; if a file is open/locked, a numbered
   copy is written instead with a warning.
-- The first run builds `.cache/card_index.pkl` (a few seconds). It rebuilds automatically
+- The first run builds `.cache/card_index.pkl` and `.cache/card_sets.pkl` (a few seconds). It rebuilds automatically
   when the data file changes, or on `--rebuild-index`.
 
 ## Printable sheets

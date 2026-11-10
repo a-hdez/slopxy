@@ -141,7 +141,7 @@ def _mask(g: Glyph, size: int, scale: float, ox: float, oy: float) -> np.ndarray
     pixel's winding number (or crossing count). Only the rows each edge spans are visited."""
     e = g.edges * scale + np.array([ox, oy, ox, oy])
     x0, y0, x1, y1 = e.T
-    keep = y0 != y1
+    keep = (y0 != y1) & ~np.isnan(y0) & ~np.isnan(y1)  # NaN y never crosses a row
     x0, y0, x1, y1 = x0[keep], y0[keep], x1[keep], y1[keep]
     direction = np.where(y1 > y0, 1, -1)
     # Rows whose center y = row + 0.5 satisfies min(y0, y1) <= y < max(y0, y1). Take one
@@ -159,7 +159,9 @@ def _mask(g: Glyph, size: int, scale: float, ox: float, oy: float) -> np.ndarray
     xs = a0 + (y - b0) * (a1 - a0) / (b1 - b0)
     # Pixel j (center j + 0.5) is right of the crossing when j + 0.5 > xs. Clip before the
     # integer cast so far-away crossings can't overflow.
-    first = np.clip(np.floor(xs - 0.5) + 1, 0, size).astype(np.int64)
+    # A NaN crossing (from infinite coordinates) is right of every pixel: it counts for none.
+    first = np.clip(np.floor(np.where(np.isnan(xs), np.inf, xs) - 0.5) + 1, 0, size)
+    first = first.astype(np.int64)
     weights = np.ones(len(rows), dtype=np.int32) if g.evenodd else direction[cols].astype(np.int32)
     out = np.zeros((size, size), dtype=np.uint8)
     if not len(rows):

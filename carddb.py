@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pickle
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -75,11 +76,12 @@ class CardDB:
         self._chars = None  # per-key character counts for suggest(), built on first use
 
     # ---------- building / loading ----------
-    # The cache is two files, each starting with a stamp so a stale file is detected without
-    # loading the rest: card_index.pkl (cards without their per-set printings, and the
-    # lookup keys) is unpickled on every run; card_sets.pkl is read and its stamp checked on
-    # every run too, but only unpickled for a Name|SET lookup. Holding its bytes means a later
-    # lookup never depends on the cache files or the data file staying as they were.
+    # The cache is two files, each starting with a stamp (card_sets.pkl: the stamp and its
+    # body size), so a stale or partial file is detected without loading the rest:
+    # card_index.pkl (cards without their per-set printings, and the lookup keys) is
+    # unpickled on every run; card_sets.pkl is read and checked on every run too, but only
+    # unpickled for a Name|SET lookup. Holding its bytes means a later lookup never depends
+    # on the cache files or the data file staying as they were.
     @classmethod
     def load(cls, data_path: Path, rebuild: bool = False, log=print) -> "CardDB":
         data_path = Path(data_path)
@@ -90,11 +92,20 @@ class CardDB:
                 with open(index, "rb") as fh:
                     if pickle.load(fh) == stamp:
                         sets_buf = io.BytesIO(sets_file.read_bytes())
-                        if pickle.load(sets_buf) == stamp:
+                        sets_stamp, size = pickle.load(sets_buf)
+                        complete = size == len(sets_buf.getbuffer()) - sets_buf.tell()
+                        if sets_stamp == stamp and complete:
                             saved = pickle.load(fh)
                             cards = saved["cards"]
-                            return cls(cards, saved["keys"],
-                                       sets_loader=lambda: _link_sets(cards, pickle.load(sets_buf)))
+
+                            def sets_loader():
+                                try:
+                                    return _link_sets(cards, pickle.load(sets_buf))
+                                except Exception:  # damaged after all: rebuild
+                                    return {n: e["sets"] for n, e in
+                                            cls._rebuild(data_path, log).cards.items()}
+
+                            return cls(cards, saved["keys"], sets_loader=sets_loader)
             except Exception:
                 pass
         return cls._rebuild(data_path, log)
@@ -112,11 +123,14 @@ class CardDB:
         # and mark its place in the sets with None (see _link_sets).
         sets = {n: {code: None if p is e["latest"] else p for code, p in e["sets"].items()}
                 for n, e in db.cards.items()}
-        # Sets first: an index is never newer than the sets file next to it.
-        for path, data in ((sets_file, sets), (index, {"cards": slim, "keys": db.keys})):
-            with open(path, "wb") as fh:
-                pickle.dump(stamp, fh, protocol=pickle.HIGHEST_PROTOCOL)
-                pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        body = pickle.dumps(sets, protocol=pickle.HIGHEST_PROTOCOL)
+        # Sets first: an index is never newer than the sets file next to it. Each file is
+        # written to a temporary name and renamed, so a reader never sees a partial file.
+        _write_atomic(sets_file, pickle.dumps((stamp, len(body)), protocol=pickle.HIGHEST_PROTOCOL)
+                      + body)
+        _write_atomic(index, pickle.dumps(stamp, protocol=pickle.HIGHEST_PROTOCOL)
+                      + pickle.dumps({"cards": slim, "keys": db.keys},
+                                     protocol=pickle.HIGHEST_PROTOCOL))
         log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {index}")
         return db
 
@@ -221,6 +235,20 @@ class CardDB:
                         f"(available: {', '.join(sorted(sets))})"
                 )
         return entry["card"], printing
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".pkl")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _link_sets(cards: dict, sets: dict) -> dict:

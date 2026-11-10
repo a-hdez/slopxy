@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import codecs
 import io
+import itertools
 import math
 import os
 import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -90,6 +90,8 @@ def compute_layout(opts: SheetOptions) -> Layout:
     card_h = round(H * dpi / DPI * scale)
     margin = round(opts.margin_in * dpi)
     gap = round(opts.gap_mm / 25.4 * dpi)
+    if card_w < 1 or card_h < 1:
+        raise ValueError(f"Card scale {opts.card_scale}% is too small to draw a card.")
 
     candidates = []
     for orient in ("portrait", "landscape"):
@@ -210,7 +212,8 @@ def _pdf_text(s: str) -> bytes:
 def _write_pdf(pages, fh, dpi: float, title: str | None) -> int:
     """Stream pages into a PDF: each page is JPEG-encoded (DCTDecode, like Pillow's PDF
     writer) and written as soon as it arrives, so only one page is in memory, and nothing is
-    read back. Catalog first, page tree and info at the end. Returns the page count."""
+    read back. The catalog and page tree come last, so an interrupted file has no root and
+    can't be mistaken for a complete one. Returns the page count."""
     offsets: dict[int, int] = {}
     pos = 0
 
@@ -227,10 +230,10 @@ def _write_pdf(pages, fh, dpi: float, title: str | None) -> int:
         out(b"\nendobj\n")
 
     out(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
-    kids, num = [], 3
+    kids, num = [], 3  # 1: catalog, 2: page tree, written at the end
     for page in pages:
-        page = page if page.mode in ("RGB", "L") else page.convert("RGB")
+        if page.mode not in ("RGB", "L"):
+            raise ValueError(f"save_pdf takes RGB or L pages, not {page.mode}")
         buf = io.BytesIO()
         page.save(buf, "JPEG")
         jpeg = buf.getvalue()
@@ -252,6 +255,7 @@ def _write_pdf(pages, fh, dpi: float, title: str | None) -> int:
         raise ValueError("no pages to save")
     obj(2, b"<< /Type /Pages /Count %d /Kids [%s] >>"
            % (len(kids), b" ".join(b"%d 0 R" % k for k in kids)))
+    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
     stamp = time.strftime("D:%Y%m%d%H%M%SZ", time.gmtime()).encode()
     info = b"<< /CreationDate (%s) /ModDate (%s)" % (stamp, stamp)
     if title:
@@ -267,20 +271,33 @@ def _write_pdf(pages, fh, dpi: float, title: str | None) -> int:
 
 
 def save_pdf(pages, path, dpi: int = DPI) -> int:
-    """Write pages (any iterable, e.g. iter_pages(...)) to a PDF, one page in memory at a
-    time; returns the page count. `path` may also be a writable file object. A path is
-    written to a temporary file next to it and renamed into place once complete, so a failed
-    or interrupted run never leaves a truncated PDF or destroys an existing one."""
+    """Write RGB/L pages (any iterable, e.g. iter_pages(...)) to a PDF with one page in
+    memory at a time; returns the page count. `path` may also be a writable file object.
+    A path is opened in place exactly as Pillow's PDF writer opened it (so permissions,
+    symlinks and a locked file behave the same), before any page is made; if writing fails,
+    a file this call created is removed."""
+    pages = iter(pages)
+    first = next(pages, None)
+    if first is None:  # before touching the target, as Pillow did
+        raise ValueError("no pages to save")
+    pages = itertools.chain([first], pages)
     if hasattr(path, "write"):
         name = getattr(path, "name", None)
-        return _write_pdf(pages, path, dpi, Path(name).stem if isinstance(name, str) else None)
-    path = Path(path)
-    tmp = path.with_name(path.name + ".part")
-    try:
-        with open(tmp, "wb") as fh:
-            n = _write_pdf(pages, fh, dpi, path.stem)
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    return n
+        return _write_pdf(pages, path, dpi, _title(name) if isinstance(name, str) else None)
+    existed = os.path.lexists(path)
+    with open(path, "w+b") as fh:
+        try:
+            return _write_pdf(pages, fh, dpi, _title(os.fspath(path)))
+        except BaseException:
+            if not existed:
+                fh.close()
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            raise
+
+
+def _title(filename: str) -> str:
+    # Pillow's PDF writer titles the document with the file name minus its extension.
+    return os.path.splitext(os.path.basename(filename))[0]

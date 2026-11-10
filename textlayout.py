@@ -149,35 +149,41 @@ def fit(paras: list[Paragraph], width: float, height: float,
         max_size: float = 34, min_size: float = 14) -> TextLayout:
     """Largest size from max_size down in 1pt steps (ending at min_size) whose layout fits.
     Text height grows with size, so instead of trying every size this gallops down from
-    the top (1, 2, 4, 8... steps) and then bisects: about 2 log2(steps) layouts at most,
-    and 2-3 when the text nearly fits at max_size. If nothing fits, the min_size layout is
-    returned with fits=False."""
-    first = layout(paras, width, max_size)  # before listing sizes: bad sizes fail here
-    if first.height <= height or max_size <= min_size:
-        first.fits = first.height <= height
-        return first
+    the top (probing 1, 2, 4, 8... steps down) and then bisects: about 2 log2(steps)
+    layouts at most, and 2-3 when the text nearly fits at max_size. If nothing fits, the
+    min_size layout is returned with fits=False. Sizes are generated as they're needed,
+    with the same arithmetic as a 1pt-step scan."""
     sizes = [max_size]
-    while sizes[-1] > min_size:
-        sizes.append(max(min_size, sizes[-1] - 1))
-    # sizes[0] doesn't fit; find the first index that does.
-    tried = {0: first}
+    ended = [max_size <= min_size]  # sizes holds every candidate
+
+    def extend(i: int) -> int:
+        """Make sizes[i] exist if it's a candidate; return the highest index <= i."""
+        while len(sizes) <= i and not ended[0]:
+            nxt = max(min_size, sizes[-1] - 1)
+            sizes.append(nxt)
+            ended[0] = nxt <= min_size
+        return min(i, len(sizes) - 1)
+
+    tried = {0: layout(paras, width, max_size)}
 
     def fits_at(i: int) -> bool:
         if i not in tried:
             tried[i] = layout(paras, width, sizes[i])
         return tried[i].height <= height
 
-    last = len(sizes) - 1
-    bad, step = 0, 1                # sizes[bad] doesn't fit
+    if fits_at(0) or ended[0]:
+        tried[0].fits = tried[0].height <= height
+        return tried[0]
+    bad, probe = 0, 1               # sizes[bad] doesn't fit
     while True:
-        probe = min(bad + step, last)
+        probe = extend(probe)
+        if probe == bad:            # bad is the last candidate: nothing fits
+            tried[bad].fits = False
+            return tried[bad]
         if fits_at(probe):
-            good = probe            # answer is in (bad, good]
+            good = probe            # the answer is in (bad, good]
             break
-        if probe == last:           # nothing fits; return the min_size layout
-            tried[last].fits = False
-            return tried[last]
-        bad, step = probe, step * 2
+        bad, probe = probe, probe * 2
     while good - bad > 1:
         mid = (bad + good) // 2
         if fits_at(mid):

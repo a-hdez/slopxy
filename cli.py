@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  wrote {path}  [{printing['set']} #{printing['collector_number']}]")
             if sheet_opts:
                 # Keep only the flattened, sheet-sized copy; the full RGBA image can go.
-                sheet_cards += [prepare_card(img, sheet_lay)] * e.qty
+                sheet_cards += [prepare_card(img, sheet_lay, sheet_opts)] * e.qty
                 if not write_images:
                     print(f"  {e.qty} x {stem}")
 

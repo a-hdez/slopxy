@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import io
 import json
 import os
 import pickle
@@ -76,7 +77,9 @@ class CardDB:
     # ---------- building / loading ----------
     # The cache is two files, each starting with a stamp so a stale file is detected without
     # loading the rest: card_index.pkl (cards without their per-set printings, and the
-    # lookup keys) is loaded on every run; card_sets.pkl only for a Name|SET lookup.
+    # lookup keys) is unpickled on every run; card_sets.pkl is read and its stamp checked on
+    # every run too, but only unpickled for a Name|SET lookup. Holding its bytes means a later
+    # lookup never depends on the cache files or the data file staying as they were.
     @classmethod
     def load(cls, data_path: Path, rebuild: bool = False, log=print) -> "CardDB":
         data_path = Path(data_path)
@@ -86,9 +89,12 @@ class CardDB:
             try:
                 with open(index, "rb") as fh:
                     if pickle.load(fh) == stamp:
-                        saved = pickle.load(fh)
-                        return cls(saved["cards"], saved["keys"],
-                                   sets_loader=lambda: cls._load_sets(data_path, stamp, log))
+                        sets_buf = io.BytesIO(sets_file.read_bytes())
+                        if pickle.load(sets_buf) == stamp:
+                            saved = pickle.load(fh)
+                            cards = saved["cards"]
+                            return cls(cards, saved["keys"],
+                                       sets_loader=lambda: _link_sets(cards, pickle.load(sets_buf)))
             except Exception:
                 pass
         return cls._rebuild(data_path, log)
@@ -102,25 +108,17 @@ class CardDB:
         index, sets_file = _cache_files(data_path)
         index.parent.mkdir(parents=True, exist_ok=True)
         slim = {n: {k: v for k, v in e.items() if k != "sets"} for n, e in db.cards.items()}
+        # The latest printing is usually also its set's entry; store it once, in the index,
+        # and mark its place in the sets with None (see _link_sets).
+        sets = {n: {code: None if p is e["latest"] else p for code, p in e["sets"].items()}
+                for n, e in db.cards.items()}
         # Sets first: an index is never newer than the sets file next to it.
-        for path, data in ((sets_file, {n: e["sets"] for n, e in db.cards.items()}),
-                           (index, {"cards": slim, "keys": db.keys})):
+        for path, data in ((sets_file, sets), (index, {"cards": slim, "keys": db.keys})):
             with open(path, "wb") as fh:
                 pickle.dump(stamp, fh, protocol=pickle.HIGHEST_PROTOCOL)
                 pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
         log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {index}")
         return db
-
-    @classmethod
-    def _load_sets(cls, data_path: Path, stamp, log) -> dict:
-        """Per-set printings for an index loaded with `stamp`; rebuilds if they're missing."""
-        try:
-            with open(_cache_files(data_path)[1], "rb") as fh:
-                if pickle.load(fh) == stamp:
-                    return pickle.load(fh)
-        except Exception:
-            pass
-        return {n: e["sets"] for n, e in cls._rebuild(data_path, log).cards.items()}
 
     def _sets_of(self, name: str) -> dict:
         entry = self.cards[name]
@@ -190,7 +188,7 @@ class CardDB:
         if self._chars is None:
             self._chars = _char_counts(list(self.keys))
         keys, lengths, alphabet, counts = self._chars
-        codes = np.frombuffer(key.encode("utf-32-le"), dtype=np.uint32)
+        codes = np.frombuffer(key.encode("utf-32-le", "surrogatepass"), dtype=np.uint32)
         pos = np.searchsorted(alphabet, codes)
         known = pos < len(alphabet)
         known[known] = alphabet[pos[known]] == codes[known]
@@ -225,6 +223,15 @@ class CardDB:
         return entry["card"], printing
 
 
+def _link_sets(cards: dict, sets: dict) -> dict:
+    """Put each card's latest printing back where card_sets.pkl marks it with None."""
+    for name, by_set in sets.items():
+        for code, printing in by_set.items():
+            if printing is None:
+                by_set[code] = cards[name]["latest"]
+    return sets
+
+
 def _cache_files(data_path: Path) -> tuple[Path, Path]:
     cache = data_path.parent / ".cache"
     return cache / "card_index.pkl", cache / "card_sets.pkl"
@@ -238,7 +245,8 @@ def _stamp(data_path: Path) -> tuple:
 def _char_counts(keys: list[str]):
     """(keys, key lengths, sorted alphabet of code points, keys x alphabet count matrix)."""
     lengths = np.fromiter(map(len, keys), dtype=np.int64, count=len(keys))
-    codes = np.frombuffer("".join(keys).encode("utf-32-le"), dtype=np.uint32)
+    codes = np.frombuffer("".join(keys).encode("utf-32-le", "surrogatepass"),
+                          dtype=np.uint32)
     alphabet, idx = np.unique(codes, return_inverse=True)
     owner = np.repeat(np.arange(len(keys)), lengths)
     counts = np.bincount(owner * len(alphabet) + idx, minlength=len(keys) * len(alphabet))

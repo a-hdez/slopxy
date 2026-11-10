@@ -17,6 +17,7 @@ from PIL import Image
 ASSET_DIR = Path(__file__).parent / "assets"
 VIEW = 512.0  # every badge uses viewBox 0 0 512 512
 BEZIER_STEPS = 12
+_BAND = 128  # rows per accumulation band in _mask
 
 # Mana symbol -> badge file stem
 BADGES = {"W": "star", "U": "droplet", "B": "skull", "R": "fireball", "G": "tree",
@@ -156,14 +157,27 @@ def _mask(g: Glyph, size: int, scale: float, ox: float, oy: float) -> np.ndarray
     rows, cols, y = rows[hit], cols[hit], y[hit]
     a0, b0, a1, b1 = a0[hit], b0[hit], a1[hit], b1[hit]
     xs = a0 + (y - b0) * (a1 - a0) / (b1 - b0)
-    # Pixel j (center j + 0.5) is right of the crossing when j + 0.5 > xs.
-    first = np.clip(np.floor(xs - 0.5).astype(np.int64) + 1, 0, size)
-    weights = np.ones(len(rows)) if g.evenodd else direction[cols]
-    delta = np.bincount(rows * (size + 1) + first, weights=weights,
-                        minlength=size * (size + 1)).reshape(size, size + 1)
-    acc = np.cumsum(delta, axis=1)[:, :size]
-    inside = (np.rint(acc) % 2 == 1) if g.evenodd else (np.rint(acc) != 0)
-    return np.where(inside, 255, 0).astype(np.uint8)
+    # Pixel j (center j + 0.5) is right of the crossing when j + 0.5 > xs. Clip before the
+    # integer cast so far-away crossings can't overflow.
+    first = np.clip(np.floor(xs - 0.5) + 1, 0, size).astype(np.int64)
+    weights = np.ones(len(rows), dtype=np.int32) if g.evenodd else direction[cols].astype(np.int32)
+    out = np.zeros((size, size), dtype=np.uint8)
+    if not len(rows):
+        return out
+    # Accumulate in int32, in bands of rows, over the rows the glyph touches only, so the
+    # scratch buffer stays small even for large masks.
+    order = np.argsort(rows, kind="stable")
+    rows, first, weights = rows[order], first[order], weights[order]
+    r_lo, r_hi = int(rows[0]), int(rows[-1]) + 1
+    for b0 in range(r_lo, r_hi, _BAND):
+        b1 = min(b0 + _BAND, r_hi)
+        i0, i1 = np.searchsorted(rows, [b0, b1])
+        delta = np.zeros((b1 - b0, size + 1), dtype=np.int32)
+        np.add.at(delta, (rows[i0:i1] - b0, first[i0:i1]), weights[i0:i1])
+        acc = np.cumsum(delta, axis=1, out=delta)[:, :size]
+        inside = (acc & 1).astype(bool) if g.evenodd else acc != 0
+        out[b0:b1][inside] = 255
+    return out
 
 
 def circle_color(sym: str) -> tuple | None:

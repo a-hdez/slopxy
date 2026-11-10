@@ -148,34 +148,44 @@ def layout(paras: list[Paragraph], width: float, size: float) -> TextLayout:
 def fit(paras: list[Paragraph], width: float, height: float,
         max_size: float = 34, min_size: float = 14) -> TextLayout:
     """Largest size from max_size down in 1pt steps (ending at min_size) whose layout fits.
-    Binary search over those sizes: text height grows with size, so this needs about
-    log2(n) layouts instead of up to n. If nothing fits, the min_size layout is returned
-    with fits=False."""
-    sizes = []
-    size = max_size
-    while True:
-        sizes.append(size)
-        if size <= min_size:
-            break
-        size = max(min_size, size - 1)
-    first = layout(paras, width, sizes[0])
-    if first.height <= height or len(sizes) == 1:
+    Text height grows with size, so instead of trying every size this gallops down from
+    the top (1, 2, 4, 8... steps) and then bisects: about 2 log2(steps) layouts at most,
+    and 2-3 when the text nearly fits at max_size. If nothing fits, the min_size layout is
+    returned with fits=False."""
+    first = layout(paras, width, max_size)  # before listing sizes: bad sizes fail here
+    if first.height <= height or max_size <= min_size:
         first.fits = first.height <= height
         return first
-    # sizes[0] doesn't fit; find the first index that does in sizes[1:].
-    lo, hi, best, lay = 1, len(sizes) - 1, None, first
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        lay = layout(paras, width, sizes[mid])
-        if lay.height <= height:
-            best, hi = lay, mid - 1
+    sizes = [max_size]
+    while sizes[-1] > min_size:
+        sizes.append(max(min_size, sizes[-1] - 1))
+    # sizes[0] doesn't fit; find the first index that does.
+    tried = {0: first}
+
+    def fits_at(i: int) -> bool:
+        if i not in tried:
+            tried[i] = layout(paras, width, sizes[i])
+        return tried[i].height <= height
+
+    last = len(sizes) - 1
+    bad, step = 0, 1                # sizes[bad] doesn't fit
+    while True:
+        probe = min(bad + step, last)
+        if fits_at(probe):
+            good = probe            # answer is in (bad, good]
+            break
+        if probe == last:           # nothing fits; return the min_size layout
+            tried[last].fits = False
+            return tried[last]
+        bad, step = probe, step * 2
+    while good - bad > 1:
+        mid = (bad + good) // 2
+        if fits_at(mid):
+            good = mid
         else:
-            lo = mid + 1
-    if best is None:  # nothing fits; the last layout tried is the one at min_size
-        lay.fits = False
-        return lay
-    best.fits = True
-    return best
+            bad = mid
+    tried[good].fits = True
+    return tried[good]
 
 
 def render(canvas: Image.Image, lay: TextLayout, x0: float, y0: float,

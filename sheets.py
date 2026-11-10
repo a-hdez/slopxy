@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import codecs
+import io
 import math
+import os
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -128,12 +133,23 @@ def _crop_marks(d: ImageDraw.ImageDraw, lay: Layout, width: int, n_cards: int):
         d.line([gx1 + 4, y, gx1 + 4 + length, y], fill=MARK_COLOR, width=width)
 
 
-def prepare_card(card: Image.Image, lay: Layout) -> Image.Image:
-    """A card as it goes on the page: resized to the layout's card size and flattened onto
-    white (transparent areas print white). RGB at sheet size is all a sheet needs to keep."""
+def _opaque_slots(lay: Layout, opts: SheetOptions) -> bool:
+    """Whether each card slot is plain white when its card is pasted: slots don't overlap
+    and no earlier card's cut line reaches into them. Then pasting a card flattened onto
+    white gives the same pixels as pasting it through its alpha."""
+    line_w = max(1, round(opts.dpi / 300))
+    return lay.gap >= (line_w if opts.cut_lines == "lines" else 0)
+
+
+def prepare_card(card: Image.Image, lay: Layout, opts: SheetOptions) -> Image.Image:
+    """A card as it goes on the page, resized to the layout's card size. Where the slots
+    are plain white (_opaque_slots) it is flattened onto white, so a sheet only needs to
+    keep an RGB copy; otherwise it stays RGBA and is pasted through its alpha."""
     img = card if card.mode == "RGBA" else card.convert("RGBA")
     if img.size != (lay.card_w, lay.card_h):
         img = img.resize((lay.card_w, lay.card_h), Image.LANCZOS)
+    if not _opaque_slots(lay, opts):
+        return img if img is not card else img.copy()
     flat = Image.new("RGB", img.size, (255, 255, 255))
     flat.paste(img, (0, 0), img)
     return flat
@@ -145,25 +161,27 @@ def page_count(n_cards: int, lay: Layout) -> int:
 
 def iter_pages(cards: list[Image.Image], opts: SheetOptions, lay: Layout | None = None):
     """Yield the sheet pages one at a time, so only one page bitmap needs to be in memory.
-    Cards already passed through prepare_card() are pasted as they are; others are prepared
-    once per distinct image."""
+    Cards from prepare_card() are pasted as they are; others are prepared once per distinct
+    image."""
     lay = lay or compute_layout(opts)
     n_pages = page_count(len(cards), lay)
     line_w = max(1, round(opts.dpi / 300))
+    size = (lay.card_w, lay.card_h)
     prepared: dict[int, Image.Image] = {}
     for p in range(n_pages):
         page = Image.new("RGB", (lay.page_w, lay.page_h), (255, 255, 255))
         d = ImageDraw.Draw(page)
         batch = cards[p * lay.per_page:(p + 1) * lay.per_page]
         for i, card in enumerate(batch):
-            if card.mode == "RGB" and card.size == (lay.card_w, lay.card_h):
-                img = card
-            else:
+            img = card
+            if not (card.size == size and (card.mode == "RGB" or (
+                    card.mode == "RGBA" and not _opaque_slots(lay, opts)))):
                 img = prepared.get(id(card))
                 if img is None:
-                    img = prepared[id(card)] = prepare_card(card, lay)
+                    img = prepared[id(card)] = prepare_card(card, lay, opts)
             x, y = lay.slot(i)
-            page.paste(img, (x, y))
+            # alpha onto white: transparent areas print white
+            page.paste(img, (x, y), img if img.mode == "RGBA" else None)
             if opts.cut_lines == "lines":
                 d.rectangle([x - line_w, y - line_w, x + lay.card_w - 1 + line_w,
                              y + lay.card_h - 1 + line_w], outline=LINE_COLOR, width=line_w)
@@ -184,13 +202,85 @@ def build_pages(cards: list[Image.Image], opts: SheetOptions) -> tuple[list[Imag
     return list(iter_pages(cards, opts, lay)), lay
 
 
-def save_pdf(pages, path, dpi: int = DPI) -> int:
-    """Write pages (any iterable) to a PDF one page at a time; returns the page count.
-    Pages after the first are appended to the file, so each can be freed once written."""
-    n = 0
+def _pdf_text(s: str) -> bytes:
+    raw = codecs.BOM_UTF16_BE + s.encode("utf-16-be")
+    return b"(" + raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)") + b")"
+
+
+def _write_pdf(pages, fh, dpi: float, title: str | None) -> int:
+    """Stream pages into a PDF: each page is JPEG-encoded (DCTDecode, like Pillow's PDF
+    writer) and written as soon as it arrives, so only one page is in memory, and nothing is
+    read back. Catalog first, page tree and info at the end. Returns the page count."""
+    offsets: dict[int, int] = {}
+    pos = 0
+
+    def out(data: bytes):
+        nonlocal pos
+        fh.write(data)
+        pos += len(data)
+
+    def obj(num: int, body: bytes, stream: bytes | None = None):
+        offsets[num] = pos
+        out(b"%d 0 obj\n" % num + body)
+        if stream is not None:
+            out(b"stream\n" + stream + b"\nendstream")
+        out(b"\nendobj\n")
+
+    out(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+    kids, num = [], 3
     for page in pages:
-        page.save(path, "PDF", resolution=dpi, append=n > 0)
-        n += 1
-    if n == 0:
+        page = page if page.mode in ("RGB", "L") else page.convert("RGB")
+        buf = io.BytesIO()
+        page.save(buf, "JPEG")
+        jpeg = buf.getvalue()
+        space = b"/DeviceRGB" if page.mode == "RGB" else b"/DeviceGray"
+        image, content, page_obj = num, num + 1, num + 2
+        obj(image, b"<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace %s "
+                   b"/BitsPerComponent 8 /Filter /DCTDecode /Length %d >>\n"
+                   % (page.width, page.height, space, len(jpeg)), jpeg)
+        w_pt, h_pt = page.width * 72.0 / dpi, page.height * 72.0 / dpi
+        draw = b"q %f 0 0 %f 0 0 cm /image Do Q\n" % (w_pt, h_pt)
+        obj(content, b"<< /Length %d >>\n" % len(draw), draw)
+        obj(page_obj, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] "
+                      b"/Resources << /ProcSet [/PDF /ImageC] /XObject << /image %d 0 R >> >> "
+                      b"/Contents %d 0 R >>" % (str(w_pt).encode(), str(h_pt).encode(),
+                                                image, content))
+        kids.append(page_obj)
+        num += 3
+    if not kids:
         raise ValueError("no pages to save")
+    obj(2, b"<< /Type /Pages /Count %d /Kids [%s] >>"
+           % (len(kids), b" ".join(b"%d 0 R" % k for k in kids)))
+    stamp = time.strftime("D:%Y%m%d%H%M%SZ", time.gmtime()).encode()
+    info = b"<< /CreationDate (%s) /ModDate (%s)" % (stamp, stamp)
+    if title:
+        info += b" /Title " + _pdf_text(title)
+    obj(num, info + b" >>")
+    xref = pos
+    out(b"xref\n0 %d\n0000000000 65535 f \n" % (num + 1))
+    for n in range(1, num + 1):
+        out(b"%010d 00000 n \n" % offsets[n])
+    out(b"trailer\n<< /Size %d /Root 1 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (num + 1, num, xref))
+    return len(kids)
+
+
+def save_pdf(pages, path, dpi: int = DPI) -> int:
+    """Write pages (any iterable, e.g. iter_pages(...)) to a PDF, one page in memory at a
+    time; returns the page count. `path` may also be a writable file object. A path is
+    written to a temporary file next to it and renamed into place once complete, so a failed
+    or interrupted run never leaves a truncated PDF or destroys an existing one."""
+    if hasattr(path, "write"):
+        name = getattr(path, "name", None)
+        return _write_pdf(pages, path, dpi, Path(name).stem if isinstance(name, str) else None)
+    path = Path(path)
+    tmp = path.with_name(path.name + ".part")
+    try:
+        with open(tmp, "wb") as fh:
+            n = _write_pdf(pages, fh, dpi, path.stem)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return n

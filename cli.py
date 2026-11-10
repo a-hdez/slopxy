@@ -8,10 +8,10 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .art import (FIT_MODES, ArtError, ArtGenerator, compose, load_image_art, load_prompt_file,
-                  new_seed, variation_hints)
-from .art.backends.comfyui import (DEFAULT_MODEL, DEFAULT_URL, PRESETS, ComfyClient,
-                                   ComfyImageBackend, ComfyTextBackend)
+from .art import (FIT_MODES, ArtError, compose, load_image_art, load_prompt_file, new_seed,
+                  variation_hints)
+from .art.config import load_config
+from .art.session import ArtSession, confirm_paid, list_backends, ordered
 from .carddb import CardDB, find_data_file
 from .render import read_meta, render_card, save
 from .sheets import (PAPER_SIZES, SheetOptions, compute_layout, iter_pages, page_count,
@@ -118,30 +118,6 @@ def _interactive() -> list[str]:
     return lines
 
 
-class ArtContext:
-    """Connects to ComfyUI on first use and keeps one generator per model/checkpoint."""
-
-    def __init__(self, args):
-        self.args = args
-        self.client = None
-        self.gens: dict[tuple, ArtGenerator] = {}
-
-    def connect(self):
-        if self.client is None:
-            client = ComfyClient(self.args.comfy_url)
-            client.check()
-            self.client = client
-
-    def gen(self, model: str, checkpoint: str | None) -> ArtGenerator:
-        key = (model, checkpoint)
-        if key not in self.gens:
-            self.connect()
-            self.gens[key] = ArtGenerator(ComfyImageBackend(self.client, model, checkpoint),
-                                          ComfyTextBackend(self.client), seed=self.args.seed,
-                                          describe=not self.args.no_describe)
-        return self.gens[key]
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="slopxy", description="Generate MTG proxy card images.")
     ap.add_argument("cards", nargs="*",
@@ -155,12 +131,33 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--art-fit", choices=FIT_MODES, default="crop",
                     help="how [image: file] art fills the window when its shape differs: crop "
                          "(fill, trim edges; default) or fit (whole image, blurred fill)")
-    g = ap.add_argument_group("AI art (needs ComfyUI Desktop running)")
-    g.add_argument("--art", action="store_true", help="generate art with ComfyUI for the art window")
-    g.add_argument("--art-model", choices=sorted(PRESETS), default=DEFAULT_MODEL,
-                   help=f"generation preset (default: {DEFAULT_MODEL})")
-    g.add_argument("--checkpoint", help="override the model file (same model family as the preset)")
-    g.add_argument("--comfy-url", default=DEFAULT_URL, help=f"ComfyUI address (default: {DEFAULT_URL})")
+    g = ap.add_argument_group("AI art (a local generator or a hosted API; see --list-backends)")
+    g.add_argument("--art", action="store_true", help="generate art for the art window")
+    g.add_argument("--art-backend", metavar="NAME",
+                   help="image backend or config profile: comfyui, a1111, openai, gemini, "
+                        "placeholder, or a [profiles.NAME] from slopxy.toml (default: the "
+                        "config's [art] image)")
+    g.add_argument("--art-model", metavar="MODEL",
+                   help="model for the image backend (comfyui: a preset such as krea2-turbo, "
+                        "sdxl-turbo, flux; openai/gemini: a model id)")
+    g.add_argument("--checkpoint", help="model file for comfyui (same family as the preset) or "
+                                        "a1111")
+    g.add_argument("--art-url", "--comfy-url", dest="art_url", metavar="URL",
+                   help="address of a local backend (comfyui, a1111)")
+    g.add_argument("--describe-backend", metavar="NAME",
+                   help="who writes scene descriptions: anthropic, openai, gemini, comfyui, or "
+                        "a profile (default: the config's [art] describe; comfyui describes "
+                        "for itself)")
+    g.add_argument("--describe-model", metavar="MODEL", help="model for --describe-backend")
+    g.add_argument("--config", metavar="FILE",
+                   help="profiles file (default: ./slopxy.toml, then the user config file)")
+    g.add_argument("--list-backends", action="store_true",
+                   help="show the backends, what each needs, and the configured profiles")
+    g.add_argument("--yes", action="store_true",
+                   help="don't ask before making many paid requests")
+    g.add_argument("--keep-art", action="store_true",
+                   help="also save each generated artwork as '<image>.art.png', so the PNG "
+                        "can be reproduced exactly even with backends that have no seeds")
     g.add_argument("--prompts", help="file of `Card Name = prompt` lines overriding auto prompts")
     g.add_argument("--no-describe", action="store_true",
                    help="skip the language-model scene description; use the template prompt")
@@ -196,6 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.runs < 1:
         ap.error("--runs must be at least 1")
+    try:
+        config = load_config(args.config)
+    except ArtError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    if args.list_backends:
+        print(list_backends(config))
+        return 0
 
     data = Path(args.data) if args.data else find_data_file(Path.cwd())
     if not data or not data.exists():
@@ -244,24 +249,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 2
 
-    ctx = ArtContext(args)
-    needs_comfy = args.art or any(
-        a.get("source") == "generated" for e in entries if e.repro for a in e.repro.get("art", []))
+    session = ArtSession(args, config)
     prompts = load_prompt_file(args.prompts) if args.prompts else {}
-    if needs_comfy:
+    if args.art:
         try:
-            ctx.connect()
-            if args.art:
-                ctx.gen(args.art_model, args.checkpoint)  # validate the model up front
+            session.main()  # connect / check the model and key before doing any work
         except ArtError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 3
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    write_images = sheet_opts is None or args.also_images
-    written, art_failed = [], []
-    sheet_cards: list = []
+    # 1. Look up the cards and decide where each art window's art comes from.
+    jobs = []
     for e in entries:
         try:
             card, printing = db.find(e.name, e.set_code)
@@ -269,18 +267,55 @@ def main(argv: list[str] | None = None) -> int:
             missing.append((e.name, err.args[0] if err.args else [],
                             err.args[1] if len(err.args) > 1 else ""))
             continue
-        for stem, img, meta in _card_images(e, card, printing, ctx, prompts, art_failed, args):
+        try:
+            jobs += _jobs(e, card, printing, session, args, prompts)
+        except ArtError as err:  # e.g. the backend that made a reproduced PNG isn't reachable
+            print(f"Error: {err}", file=sys.stderr)
+            return 3
+
+    # 2. Plan every generation (scene descriptions first, all of them), after asking if
+    #    that means many paid requests.
+    windows = [(j, w) for j in jobs for w in j.windows or ()]
+    paid_images = [w.gen.image for _, w in windows if w.gen and w.gen.image.paid]
+    paid_texts = [w.gen.text for _, w in windows
+                  if w.gen and w.will_describe(args) and w.gen.text.paid]
+    if not confirm_paid(paid_images, paid_texts, args.yes):
+        return 4
+    planning = [(j, w) for j, w in windows if w.kind in ("new", "repro")]
+    for (j, w), result in ordered(planning, lambda jw: _plan(*jw, prompts, args),
+                                  session.workers("text")):
+        if isinstance(result, Exception):
+            w.error = result
+        else:
+            w.spec = result
+
+    # 3. Generate (in parallel where the backend allows), compose and write, in order.
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    write_images = sheet_opts is None or args.also_images
+    written, art_failed, kept_paths = [], [], []
+    sheet_cards: list = []
+    renders: dict = {}
+    for j, arts in ordered(jobs, lambda j: _generate(j, session),
+                           session.workers("image")):
+        for stem, img, meta, kept in _compose_job(j, arts, renders, art_failed, args):
             if write_images:
                 target = out / f"{stem}.png"  # never overwrite a file from this same run
-                path = _write(target, lambda p: save(img, p, meta),
+                path = _write(target, lambda p: _save_card(img, p, meta, kept),
                               args.overwrite and target not in written)
                 written.append(path)
-                print(f"  wrote {path}  [{printing['set']} #{printing['collector_number']}]")
+                print(f"  wrote {path}  [{j.printing['set']} #{j.printing['collector_number']}]")
+            elif kept:
+                for key, art in kept:  # no card PNG to sit next to: just the art
+                    target = out / f"{stem}.art{key}.png"
+                    path = _write(target, art.save, args.overwrite and target not in kept_paths)
+                    kept_paths.append(path)
+                    print(f"  kept art {path}")
             if sheet_opts:
                 # Keep only the flattened, sheet-sized copy; the full RGBA image can go.
-                sheet_cards += [prepare_card(img, sheet_lay, sheet_opts)] * e.qty
+                sheet_cards += [prepare_card(img, sheet_lay, sheet_opts)] * j.entry.qty
                 if not write_images:
-                    print(f"  {e.qty} x {stem}")
+                    print(f"  {j.entry.qty} x {stem}")
 
     if written:
         print(f"\n{len(written)} image(s) written to {out.resolve()}")
@@ -355,46 +390,53 @@ def _write(path: Path, writer, overwrite: bool) -> Path:
     return path
 
 
-def _window_spec(e: Entry, w, label, card, ctx: ArtContext, prompts, args,
-                 run: int = 0, hints: list[str] | None = None) -> dict | None:
-    """How to fill one art window: user image, reproduced spec, new generation, or nothing.
-    With several runs, each one is planned separately (new description and seed); a fixed
-    --seed becomes seed, seed+1, ...; reproduced PNGs get new seeds unless --redescribe.
-    hints (one per run) steer each run's scene description somewhere different."""
-    hint = hints[run] if hints else None
-    if e.image:
-        return {"source": "image", "path": str(Path(e.image).resolve()), "fit": e.fit or args.art_fit}
-    if e.repro is not None:
-        saved = next((a for a in e.repro.get("art", []) if a.get("window") == w.key), None)
-        if saved is None:
-            return None
-        spec = {k: v for k, v in saved.items() if k not in ("window", "face")}
-        if spec.get("source") == "generated":
-            gen = ctx.gen(spec["model"], spec["checkpoint"])
-            if args.redescribe:
-                spec = gen.restyle(spec, w.face, label, hint)
-            if args.seed is not None:
-                spec["seed"] = args.seed + run
-            elif args.new_seed or (hints and not args.redescribe):
-                spec["seed"] = new_seed()
-        return spec
-    if args.art:
-        override = (e.art_prompt or prompts.get(w.face.name.lower())
-                    or prompts.get(card["name"].lower()))
-        spec = ctx.gen(args.art_model, args.checkpoint).plan(w.face, w.rect, override, label, hint)
-        if args.seed is not None:
-            spec["seed"] = args.seed + run
-        return spec
-    return None
+@dataclass
+class Window:
+    """One art window of one image to write, and where its art comes from."""
+    rect: tuple
+    face: object
+    key: str
+    label: str
+    kind: str = "none"       # none | image (a file) | kept (--keep-art file) | new | repro
+    spec: dict | None = None
+    gen: object = None       # ArtGenerator for new / repro
+    override: str | None = None   # custom prompt for new art
+    hint: str | None = None       # per-run direction for the scene description
+    error: Exception | None = None
+
+    def will_describe(self, args) -> bool:
+        if self.gen is None or self.gen.text is None:
+            return False
+        return (self.kind == "new" and self.gen.describe and not self.override) or (
+            self.kind == "repro" and args.redescribe)
 
 
-def _card_images(e: Entry, card, printing, ctx: ArtContext, prompts, art_failed, args):
-    """Yield (file stem, final image, metadata) for each image the card renders to."""
+@dataclass
+class Job:
+    """One image to write (one face, one run), or for cards with no art to plan, all of a
+    card's faces (windows is None)."""
+    entry: Entry
+    card: dict
+    printing: dict
+    suffix: str | None = None
+    stem: str = ""
+    run: int = 0
+    runs: bool = False       # one of several runs
+    windows: list | None = None
+
+
+def _jobs(e: Entry, card, printing, session: ArtSession, args, prompts=None) -> list[Job]:
+    """The images an entry turns into, with each art window's source decided (no requests
+    made yet, apart from connecting to the backends involved)."""
+    if not ((args.art and not e.image) or e.repro is not None):
+        return [Job(e, card, printing)]
+    prompts = prompts or {}
     tag = " (full art)" if e.full_art else ""
-    generated = args.art or bool(e.repro and any(
-        a.get("source") == "generated" for a in e.repro.get("art", [])))
+    generated = args.art or any(a.get("source") == "generated"
+                                for a in (e.repro or {}).get("art", []))
     n_runs = (e.runs or args.runs) if generated and not e.image else 1
     only = e.repro.get("suffix", "") if e.repro is not None else None
+    jobs = []
     for r in render_card(card, printing, full_art=e.full_art, only=only or None):
         if e.repro is not None and r.suffix != e.repro.get("suffix", ""):
             continue  # reproducing one face of a double-faced card
@@ -402,32 +444,161 @@ def _card_images(e: Entry, card, printing, ctx: ArtContext, prompts, art_failed,
         face = r.windows[0].face if r.windows else None
         hints = variation_hints(n_runs, face) if n_runs > 1 else None
         for run in range(n_runs):
-            yield stem, *_compose_run(e, r, stem, card, printing, ctx, prompts, art_failed,
-                                      args, run, hints)
+            windows = [_decide(e, w, stem + w.key + (f" run {run + 1}" if hints else ""),
+                               card, session, args, prompts, hints[run] if hints else None)
+                       for w in r.windows]
+            jobs.append(Job(e, card, printing, r.suffix, stem, run, bool(hints), windows))
+    return jobs
 
 
-def _compose_run(e, r, stem, card, printing, ctx, prompts, art_failed, args, run, hints):
-    """(final image, metadata) for one rendered face, filling its art windows."""
-    img = r.image
-    layers, art_meta = [], []
-    for w in r.windows:
-        label = stem + w.key + (f" run {run + 1}" if hints else "")
+def _decide(e: Entry, w, label, card, session: ArtSession, args, prompts, hint) -> Window:
+    """Where one window's art comes from: user image, kept art, reproduced spec, new art."""
+    win = Window(w.rect, w.face, w.key, label, hint=hint)
+    if e.image:
+        win.kind, win.spec = "image", {"source": "image", "path": str(Path(e.image).resolve()),
+                                       "fit": e.fit or args.art_fit}
+        return win
+    if e.repro is not None:
+        saved = next((a for a in e.repro.get("art", []) if a.get("window") == w.key), None)
+        if saved is None:
+            return win
+        spec = {k: v for k, v in saved.items() if k not in ("window", "face")}
+        if spec.get("source") != "generated":
+            win.kind, win.spec = "image", spec
+            return win
+        kept = spec.pop("kept_art", None)
+        changing = args.redescribe or args.new_seed or args.seed is not None or hint is not None
+        if kept and not changing:
+            path = e.png.parent / kept
+            if path.exists():
+                spec["_art_path"] = str(path)
+                win.kind, win.spec = "kept", spec
+                return win
+            session.note(f"kept:{path}", f"  kept art {path} is missing; generating it again")
+        win.kind, win.spec, win.gen = "repro", spec, session.for_spec(spec)
+        if spec.get("seed") is None and not args.redescribe:
+            backend = spec.get("backend", "comfyui")
+            session.note(f"noseed:{backend}", f"  {backend} takes no seed, so reproducing makes "
+                                              "a new image from the same prompt (--keep-art "
+                                              "keeps art for exact copies)")
+        return win
+    if args.art:
+        win.kind, win.gen = "new", session.main()
+        win.override = (e.art_prompt or prompts.get(w.face.name.lower())
+                        or prompts.get(card["name"].lower()))
+    return win
+
+
+def _plan(j: Job, w: Window, prompts, args):
+    """The full spec for a new or reproduced window (writes scene descriptions). Returns the
+    spec, or the exception that stopped it."""
+    try:
+        if w.kind == "repro":
+            spec = dict(w.spec)
+            if args.redescribe:
+                spec = w.gen.restyle(spec, w.face, w.label, w.hint)
+            if spec.get("seed") is not None:
+                if args.seed is not None:
+                    spec["seed"] = args.seed + j.run
+                elif args.new_seed or (j.runs and not args.redescribe):
+                    spec["seed"] = new_seed()
+            return spec
+        spec = w.gen.plan(w.face, w.rect, w.override, w.label, w.hint)
+        if args.seed is not None and spec.get("seed") is not None:
+            spec["seed"] = args.seed + j.run
+        return spec
+    except Exception as e:  # noqa: BLE001 - one window failing must not stop the run
+        return e
+
+
+def _generate(j: Job, session: ArtSession):
+    """Art for each window of a job: (image, fit mode), None, or the exception."""
+    if j.windows is None:
+        return None
+    results = []
+    for w in j.windows:
         try:
-            spec = _window_spec(e, w, label, card, ctx, prompts, args, run, hints)
-            if not spec:
-                continue
-            if spec["source"] == "image":
-                art, mode = load_image_art(spec["path"]), spec.get("fit", "crop")
+            if w.error is not None:
+                raise w.error
+            if w.kind == "none" or w.spec is None:
+                results.append(None)
+            elif w.kind == "image":
+                results.append((load_image_art(w.spec["path"]), w.spec.get("fit", "crop")))
+            elif w.kind == "kept":
+                results.append((load_image_art(w.spec["_art_path"]), "crop"))
             else:
-                art, mode = ctx.gen(spec["model"], spec["checkpoint"]).generate(spec, label), "crop"
-            layers.append((art, w.rect, mode))
-            art_meta.append({"window": w.key, "face": w.face.name, **spec})
-        except (ArtError, OSError) as err:
-            art_failed.append((label, str(err)))
-            print(f"  art failed for {label}: {err}", file=sys.stderr)
-    if layers:
-        img = compose(img, layers)
-    meta = {"version": META_VERSION, "card": card["name"], "set": printing["set"],
+                with session.limit(w.gen.image):
+                    results.append((w.gen.generate(w.spec, w.label), "crop"))
+        except Exception as e:  # noqa: BLE001
+            results.append(e)
+    return results
+
+
+def _failure(e: Exception) -> str:
+    return str(e) if isinstance(e, (ArtError, OSError)) else f"{type(e).__name__}: {e}"
+
+
+def _compose_job(j: Job, arts, renders: dict, art_failed: list, args):
+    """Yield (file stem, final image, metadata, art to keep) for each image of a job."""
+    e = j.entry
+    if j.windows is None:  # nothing planned: every face, with the entry's own image if any
+        tag = " (full art)" if e.full_art else ""
+        for r in render_card(j.card, j.printing, full_art=e.full_art):
+            stem = f"{safe_filename(j.card['name'])}{tag}{r.suffix}"
+            layers, art_meta = [], []
+            for w in r.windows if e.image else ():
+                spec = {"source": "image", "path": str(Path(e.image).resolve()),
+                        "fit": e.fit or args.art_fit}
+                try:
+                    layers.append((load_image_art(spec["path"]), w.rect, spec["fit"]))
+                    art_meta.append({"window": w.key, "face": w.face.name, **spec})
+                except OSError as err:
+                    art_failed.append((stem + w.key, str(err)))
+                    print(f"  art failed for {stem + w.key}: {err}", file=sys.stderr)
+            img = compose(r.image, layers) if layers else r.image
+            yield stem, img, _meta(e, j.card, j.printing, r.suffix, art_meta), []
+        return
+    key = (id(e), j.suffix)
+    if key not in renders:  # the runs of one face share one render
+        renders.clear()
+        renders[key] = next(r for r in render_card(j.card, j.printing, full_art=e.full_art,
+                                                    only=j.suffix or None)
+                            if r.suffix == j.suffix)
+    r = renders[key]
+    layers, art_meta, kept = [], [], []
+    for w, res in zip(j.windows, arts):
+        if isinstance(res, Exception):
+            art_failed.append((w.label, _failure(res)))
+            print(f"  art failed for {w.label}: {_failure(res)}", file=sys.stderr)
+            continue
+        if res is None:
+            continue
+        art, mode = res
+        layers.append((art, w.rect, mode))
+        entry = {"window": w.key, "face": w.face.name,
+                 **{k: v for k, v in w.spec.items() if not k.startswith("_")}}
+        if w.kind == "kept" and not args.keep_art:
+            entry["kept_art"] = str(Path(w.spec["_art_path"]).resolve())
+        if args.keep_art and w.kind in ("new", "repro", "kept"):
+            kept.append((w.key, art))
+        art_meta.append(entry)
+    img = compose(r.image, layers) if layers else r.image
+    yield j.stem, img, _meta(e, j.card, j.printing, r.suffix, art_meta), kept
+
+
+def _meta(e: Entry, card, printing, suffix, art_meta) -> dict:
+    return {"version": META_VERSION, "card": card["name"], "set": printing["set"],
             "collector_number": printing["collector_number"], "full_art": e.full_art,
-            "suffix": r.suffix, "custom_prompt": e.art_prompt, "art": art_meta}
-    return img, meta
+            "suffix": suffix, "custom_prompt": e.art_prompt, "art": art_meta}
+
+
+def _save_card(img, path: Path, meta: dict, kept: list) -> None:
+    """Save a card PNG; with kept art, also each artwork as '<name>.art<window>.png' next to
+    it, recorded (relative to the PNG) in the metadata."""
+    names = {key: f"{path.stem}.art{key}.png" for key, _ in kept}
+    if names:
+        meta = {**meta, "art": [{**a, "kept_art": names[a["window"]]}
+                                if a["window"] in names else a for a in meta["art"]]}
+    save(img, path, meta)
+    for key, art in kept:
+        (art.convert("RGB") if art.mode == "CMYK" else art).save(path.parent / names[key])

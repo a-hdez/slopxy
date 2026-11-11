@@ -17,6 +17,7 @@ from PIL import Image
 ASSET_DIR = Path(__file__).parent / "assets"
 VIEW = 512.0  # every badge uses viewBox 0 0 512 512
 BEZIER_STEPS = 12
+_BAND = 128  # rows per accumulation band in _mask
 
 # Mana symbol -> badge file stem
 BADGES = {"W": "star", "U": "droplet", "B": "skull", "R": "fireball", "G": "tree",
@@ -56,9 +57,14 @@ def _transform(attr: str | None):
     return tx, ty, s
 
 
+_T = np.linspace(0, 1, BEZIER_STEPS + 1)[1:]  # curve parameters of each flattened segment end
+
+
 def _path_edges(d: str, tx: float, ty: float, s: float) -> np.ndarray:
     tokens = re.findall(r"[MLCZ]|" + _NUM.pattern, d)
-    edges, start, cur = [], None, None
+    # pieces: a line edge (x0, y0, x1, y1), or the index of a cubic curve in `curves`,
+    # which are all flattened together afterwards.
+    pieces, curves, start, cur = [], [], None, None
     i, cmd = 0, None
     while i < len(tokens):
         if tokens[i] in "MLCZ":
@@ -66,7 +72,7 @@ def _path_edges(d: str, tx: float, ty: float, s: float) -> np.ndarray:
             i += 1
             if cmd == "Z":
                 if cur and start and cur != start:
-                    edges.append((*cur, *start))
+                    pieces.append((*cur, *start))
                 cur = start
                 continue
         nums = lambda k: [float(t) for t in tokens[i:i + k]]
@@ -76,24 +82,27 @@ def _path_edges(d: str, tx: float, ty: float, s: float) -> np.ndarray:
             cmd = "L"  # extra coordinate pairs after M are line-tos
         elif cmd == "L":
             p = tuple(nums(2))
-            edges.append((*cur, *p))
+            pieces.append((*cur, *p))
             cur = p
             i += 2
         elif cmd == "C":
             x1, y1, x2, y2, x3, y3 = nums(6)
-            t = np.linspace(0, 1, BEZIER_STEPS + 1)[1:]
-            mt = 1 - t
-            xs = mt**3 * cur[0] + 3 * mt**2 * t * x1 + 3 * mt * t**2 * x2 + t**3 * x3
-            ys = mt**3 * cur[1] + 3 * mt**2 * t * y1 + 3 * mt * t**2 * y2 + t**3 * y3
-            prev = cur
-            for p in zip(xs, ys):
-                edges.append((*prev, *p))
-                prev = p
+            pieces.append(len(curves))
+            curves.append((*cur, x1, y1, x2, y2, x3, y3))
             cur = (x3, y3)
             i += 6
         else:
             raise ValueError(f"unsupported path data near {tokens[i]!r}")
-    a = np.array(edges, dtype=float).reshape(-1, 4)
+    if curves:
+        cx, cy, x1, y1, x2, y2, x3, y3 = (c[:, None] for c in np.array(curves, dtype=float).T)
+        t, mt = _T, 1 - _T
+        xs = mt**3 * cx + 3 * mt**2 * t * x1 + 3 * mt * t**2 * x2 + t**3 * x3
+        ys = mt**3 * cy + 3 * mt**2 * t * y1 + 3 * mt * t**2 * y2 + t**3 * y3
+        # Segment k of curve n runs from point k-1 (the curve's start for k = 0) to point k.
+        seg = np.stack([np.hstack([cx, xs[:, :-1]]), np.hstack([cy, ys[:, :-1]]), xs, ys],
+                       axis=-1)  # (curves, steps, 4)
+    chunks = [seg[p] if isinstance(p, int) else np.array([p], dtype=float) for p in pieces]
+    a = np.concatenate(chunks) if chunks else np.zeros((0, 4))
     a[:, [0, 2]] = a[:, [0, 2]] * s + tx
     a[:, [1, 3]] = a[:, [1, 3]] * s + ty
     return a
@@ -125,29 +134,51 @@ def load(stem: str) -> Badge:
 
 def _mask(g: Glyph, size: int, scale: float, ox: float, oy: float) -> np.ndarray:
     """Coverage mask (size x size, 0/255) of a glyph scaled by `scale` and offset by (ox, oy)
-    pixels, sampled at pixel centers; supersample by passing a large size."""
+    pixels, sampled at pixel centers; supersample by passing a large size.
+
+    Each edge crossing a row's center line at x adds its direction (or 1, for evenodd) to
+    every pixel whose center lies right of x; a running sum along the row then gives each
+    pixel's winding number (or crossing count). Only the rows each edge spans are visited."""
     e = g.edges * scale + np.array([ox, oy, ox, oy])
     x0, y0, x1, y1 = e.T
-    keep = y0 != y1
+    keep = (y0 != y1) & ~np.isnan(y0) & ~np.isnan(y1)  # NaN y never crosses a row
     x0, y0, x1, y1 = x0[keep], y0[keep], x1[keep], y1[keep]
     direction = np.where(y1 > y0, 1, -1)
+    # Rows whose center y = row + 0.5 satisfies min(y0, y1) <= y < max(y0, y1). Take one
+    # extra row on each side, then keep the pairs that pass the exact test below.
+    lo = np.clip(np.ceil(np.minimum(y0, y1) - 0.5) - 1, 0, size).astype(np.int64)
+    hi = np.clip(np.ceil(np.maximum(y0, y1) - 0.5) + 1, 0, size).astype(np.int64)
+    counts = hi - lo
+    cols = np.repeat(np.arange(len(x0)), counts)
+    rows = np.repeat(lo - np.cumsum(counts) + counts, counts) + np.arange(counts.sum())
+    y = rows + 0.5
+    a0, b0, a1, b1 = x0[cols], y0[cols], x1[cols], y1[cols]
+    hit = ((b0 <= y) & (b1 > y)) | ((b1 <= y) & (b0 > y))
+    rows, cols, y = rows[hit], cols[hit], y[hit]
+    a0, b0, a1, b1 = a0[hit], b0[hit], a1[hit], b1[hit]
+    xs = a0 + (y - b0) * (a1 - a0) / (b1 - b0)
+    # Pixel j (center j + 0.5) is right of the crossing when j + 0.5 > xs. Clip before the
+    # integer cast so far-away crossings can't overflow.
+    # A NaN crossing (from infinite coordinates) is right of every pixel: it counts for none.
+    first = np.clip(np.floor(np.where(np.isnan(xs), np.inf, xs) - 0.5) + 1, 0, size)
+    first = first.astype(np.int64)
+    weights = np.ones(len(rows), dtype=np.int32) if g.evenodd else direction[cols].astype(np.int32)
     out = np.zeros((size, size), dtype=np.uint8)
-    px = np.arange(size) + 0.5
-    for row in range(size):
-        y = row + 0.5
-        hit = ((y0 <= y) & (y1 > y)) | ((y1 <= y) & (y0 > y))
-        if not hit.any():
-            continue
-        xs = x0[hit] + (y - y0[hit]) * (x1[hit] - x0[hit]) / (y1[hit] - y0[hit])
-        order = np.argsort(xs)
-        xs = xs[order]
-        idx = np.searchsorted(xs, px)
-        if g.evenodd:
-            inside = idx % 2 == 1
-        else:
-            wind = np.concatenate([[0], np.cumsum(direction[hit][order])])
-            inside = wind[idx] != 0
-        out[row, inside] = 255
+    if not len(rows):
+        return out
+    # Accumulate in int32, in bands of rows, over the rows the glyph touches only, so the
+    # scratch buffer stays small even for large masks.
+    order = np.argsort(rows, kind="stable")
+    rows, first, weights = rows[order], first[order], weights[order]
+    r_lo, r_hi = int(rows[0]), int(rows[-1]) + 1
+    for b0 in range(r_lo, r_hi, _BAND):
+        b1 = min(b0 + _BAND, r_hi)
+        i0, i1 = np.searchsorted(rows, [b0, b1])
+        delta = np.zeros((b1 - b0, size + 1), dtype=np.int32)
+        np.add.at(delta, (rows[i0:i1] - b0, first[i0:i1]), weights[i0:i1])
+        acc = np.cumsum(delta, axis=1, out=delta)[:, :size]
+        inside = (acc & 1).astype(bool) if g.evenodd else acc != 0
+        out[b0:b1][inside] = 255
     return out
 
 
@@ -164,5 +195,5 @@ def glyph_layer(sym: str, size: int, box: tuple[float, float, float, float]) -> 
     layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     for g in badge.glyphs:
         m = Image.fromarray(_mask(g, size, w / VIEW, x, y), "L")
-        layer.paste(Image.new("RGBA", (size, size), g.fill + (255,)), (0, 0), m)
+        layer.paste(g.fill + (255,), (0, 0, size, size), m)
     return layer

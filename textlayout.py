@@ -99,11 +99,15 @@ def build_paragraphs(oracle: str | None, flavor: str | None = None,
     return paras
 
 
-def _piece_width(draw: ImageDraw.ImageDraw, piece, size: float) -> float:
-    kind, text, style = piece
-    if kind == "sym":
-        return size * SYM_SCALE + size * 0.08
-    return draw.textlength(text, font=font(STYLE_ROLE[style], size))
+def _unit_widths(unit, size: float) -> list[float]:
+    """Advance width of each piece of a unit (word) at the given font size."""
+    widths = []
+    for kind, text, style in unit:
+        if kind == "sym":
+            widths.append(size * SYM_SCALE + size * 0.08)
+        else:
+            widths.append(font(STYLE_ROLE[style], size).getlength(text))
+    return widths
 
 
 @dataclass
@@ -115,9 +119,8 @@ class TextLayout:
 
 
 def layout(paras: list[Paragraph], width: float, size: float) -> TextLayout:
-    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     line_h = size * LINE_SCALE
-    space = draw.textlength(" ", font=font("rules", size))
+    space = font("rules", size).getlength(" ")
     ops, y = [], 0.0
     for p in paras:
         y += p.gap * size
@@ -126,15 +129,15 @@ def layout(paras: list[Paragraph], width: float, size: float) -> TextLayout:
         x = 0.0
         line_started = False
         for unit in p.units:
-            uw = sum(_piece_width(draw, pc, size) for pc in unit)
+            widths = _unit_widths(unit, size)  # measured once, used for wrapping and placement
+            uw = sum(widths)
             if line_started and x + space + uw > width:
                 y += line_h
                 x = 0.0
                 line_started = False
             if line_started:
                 x += space
-            for pc in unit:
-                w = _piece_width(draw, pc, size)
+            for pc, w in zip(unit, widths):
                 ops.append(("text" if pc[0] == "text" else "sym", x, y, pc[1], pc[2]))
                 x += w
             line_started = True
@@ -144,13 +147,51 @@ def layout(paras: list[Paragraph], width: float, size: float) -> TextLayout:
 
 def fit(paras: list[Paragraph], width: float, height: float,
         max_size: float = 34, min_size: float = 14) -> TextLayout:
-    size = max_size
+    """Largest size from max_size down in 1pt steps (ending at min_size) whose layout fits.
+    Text height grows with size, so instead of trying every size this gallops down from
+    the top (probing 1, 2, 4, 8... steps down) and then bisects: about 2 log2(steps)
+    layouts at most, and 2-3 when the text nearly fits at max_size. If nothing fits, the
+    min_size layout is returned with fits=False. Sizes are generated as they're needed,
+    with the same arithmetic as a 1pt-step scan."""
+    sizes = [max_size]
+    ended = [max_size <= min_size]  # sizes holds every candidate
+
+    def extend(i: int) -> int:
+        """Make sizes[i] exist if it's a candidate; return the highest index <= i."""
+        while len(sizes) <= i and not ended[0]:
+            nxt = max(min_size, sizes[-1] - 1)
+            sizes.append(nxt)
+            ended[0] = nxt <= min_size
+        return min(i, len(sizes) - 1)
+
+    tried = {0: layout(paras, width, max_size)}
+
+    def fits_at(i: int) -> bool:
+        if i not in tried:
+            tried[i] = layout(paras, width, sizes[i])
+        return tried[i].height <= height
+
+    if fits_at(0) or ended[0]:
+        tried[0].fits = tried[0].height <= height
+        return tried[0]
+    bad, probe = 0, 1               # sizes[bad] doesn't fit
     while True:
-        lay = layout(paras, width, size)
-        if lay.height <= height or size <= min_size:
-            lay.fits = lay.height <= height
-            return lay
-        size = max(min_size, size - 1)
+        probe = extend(probe)
+        if probe == bad:            # bad is the last candidate: nothing fits
+            tried[bad].fits = False
+            return tried[bad]
+        if fits_at(probe):
+            good = probe            # the answer is in (bad, good]
+            break
+        bad, probe = probe, probe * 2
+    while good - bad > 1:
+        mid = (bad + good) // 2
+        if fits_at(mid):
+            good = mid
+        else:
+            bad = mid
+    tried[good].fits = True
+    return tried[good]
 
 
 def render(canvas: Image.Image, lay: TextLayout, x0: float, y0: float,

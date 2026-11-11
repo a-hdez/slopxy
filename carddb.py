@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import difflib
+import io
 import json
 import os
 import pickle
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
 
-INDEX_VERSION = 2
+import numpy as np
+
+INDEX_VERSION = 3  # 3: stamp ahead of the data; per-set printings in their own file
 
 # Oracle-level fields kept for the card and for each face.
 CARD_FIELDS = (
@@ -61,36 +65,83 @@ def _slim_printing(raw: dict) -> dict:
 
 
 class CardDB:
-    def __init__(self, cards: dict, keys: dict):
+    def __init__(self, cards: dict, keys: dict, sets_loader=None):
         # cards: name -> {"card": {...}, "latest": printing, "sets": {SET: printing}, "token": bool}
         # keys: normalized name/face name -> card name
+        # sets_loader: when the entries come without "sets" (loaded from the cache), a
+        # function returning {name: {SET: printing}}, called the first time a set is needed.
         self.cards = cards
         self.keys = keys
+        self._sets_loader = sets_loader
+        self._chars = None  # per-key character counts for suggest(), built on first use
 
     # ---------- building / loading ----------
+    # The cache is two files, each starting with a stamp (card_sets.pkl: the stamp and its
+    # body size), so a stale or partial file is detected without loading the rest:
+    # card_index.pkl (cards without their per-set printings, and the lookup keys) is
+    # unpickled on every run; card_sets.pkl is read and checked on every run too, but only
+    # unpickled for a Name|SET lookup. Holding its bytes means a later lookup never depends
+    # on the cache files or the data file staying as they were.
     @classmethod
     def load(cls, data_path: Path, rebuild: bool = False, log=print) -> "CardDB":
         data_path = Path(data_path)
-        cache = data_path.parent / ".cache" / "card_index.pkl"
-        st = data_path.stat()
-        stamp = (INDEX_VERSION, data_path.name, st.st_size, int(st.st_mtime))
-        if cache.exists() and not rebuild:
+        index, sets_file = _cache_files(data_path)
+        stamp = _stamp(data_path)
+        if index.exists() and not rebuild:
             try:
-                with open(cache, "rb") as fh:
-                    saved = pickle.load(fh)
-                if saved.get("stamp") == stamp:
-                    return cls(saved["cards"], saved["keys"])
+                with open(index, "rb") as fh:
+                    if pickle.load(fh) == stamp:
+                        sets_buf = io.BytesIO(sets_file.read_bytes())
+                        sets_stamp, size = pickle.load(sets_buf)
+                        complete = size == len(sets_buf.getbuffer()) - sets_buf.tell()
+                        if sets_stamp == stamp and complete:
+                            saved = pickle.load(fh)
+                            cards = saved["cards"]
+
+                            def sets_loader():
+                                try:
+                                    return _link_sets(cards, pickle.load(sets_buf))
+                                except Exception:  # damaged after all: rebuild
+                                    return {n: e["sets"] for n, e in
+                                            cls._rebuild(data_path, log).cards.items()}
+
+                            return cls(cards, saved["keys"], sets_loader=sets_loader)
             except Exception:
                 pass
+        return cls._rebuild(data_path, log)
+
+    @classmethod
+    def _rebuild(cls, data_path: Path, log) -> "CardDB":
         log(f"Building card index from {data_path.name} (one-time, may take a minute)...")
         t0 = time.time()
+        stamp = _stamp(data_path)
         db = cls._build(data_path)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache, "wb") as fh:
-            pickle.dump({"stamp": stamp, "cards": db.cards, "keys": db.keys}, fh,
-                        protocol=pickle.HIGHEST_PROTOCOL)
-        log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {cache}")
+        index, sets_file = _cache_files(data_path)
+        index.parent.mkdir(parents=True, exist_ok=True)
+        slim = {n: {k: v for k, v in e.items() if k != "sets"} for n, e in db.cards.items()}
+        # The latest printing is usually also its set's entry; store it once, in the index,
+        # and mark its place in the sets with None (see _link_sets).
+        sets = {n: {code: None if p is e["latest"] else p for code, p in e["sets"].items()}
+                for n, e in db.cards.items()}
+        body = pickle.dumps(sets, protocol=pickle.HIGHEST_PROTOCOL)
+        # Sets first: an index is never newer than the sets file next to it. Each file is
+        # written to a temporary name and renamed, so a reader never sees a partial file.
+        _write_atomic(sets_file, pickle.dumps((stamp, len(body)), protocol=pickle.HIGHEST_PROTOCOL)
+                      + body)
+        _write_atomic(index, pickle.dumps(stamp, protocol=pickle.HIGHEST_PROTOCOL)
+                      + pickle.dumps({"cards": slim, "keys": db.keys},
+                                     protocol=pickle.HIGHEST_PROTOCOL))
+        log(f"Indexed {len(db.cards):,} cards in {time.time() - t0:.1f}s -> {index}")
         return db
+
+    def _sets_of(self, name: str) -> dict:
+        entry = self.cards[name]
+        if "sets" not in entry and self._sets_loader is not None:
+            loader, self._sets_loader = self._sets_loader, None
+            for n, sets in loader().items():
+                if n in self.cards:
+                    self.cards[n]["sets"] = sets
+        return entry.get("sets", {})
 
     @classmethod
     def _build(cls, data_path: Path) -> "CardDB":
@@ -142,27 +193,92 @@ class CardDB:
         return cls(cards, keys)
 
     # ---------- lookup ----------
+    def suggest(self, key: str, n: int = 5, cutoff: float = 0.75) -> list[str]:
+        """Card names whose keys are close to `key` (difflib), best first.
+        Same result as difflib.get_close_matches over every key, but keys that can't reach
+        the cutoff are dropped first, all at once with numpy: get_close_matches keeps a key
+        only if its quick_ratio, 2 * (characters in common, with multiplicity) / (total
+        length), reaches the cutoff."""
+        if self._chars is None:
+            self._chars = _char_counts(list(self.keys))
+        keys, lengths, alphabet, counts = self._chars
+        codes = np.frombuffer(key.encode("utf-32-le", "surrogatepass"), dtype=np.uint32)
+        pos = np.searchsorted(alphabet, codes)
+        known = pos < len(alphabet)
+        known[known] = alphabet[pos[known]] == codes[known]
+        query = np.bincount(pos[known], minlength=len(alphabet))
+        common = np.minimum(counts, query).sum(axis=1)
+        total = lengths + len(key)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.where(total > 0, 2.0 * common / total, 1.0)
+        pool = [keys[i] for i in np.flatnonzero(ratio >= cutoff)]
+        suggestions = []
+        for k in difflib.get_close_matches(key, pool, n=n, cutoff=cutoff):
+            if self.keys[k] not in suggestions:
+                suggestions.append(self.keys[k])
+        return suggestions
+
     def find(self, query: str, set_code: str | None = None):
         """Return (card, printing) or raise LookupError with suggestions."""
         key = normalize(query)
         name = self.keys.get(key)
         if name is None:
-            close = difflib.get_close_matches(key, self.keys.keys(), n=5, cutoff=0.75)
-            suggestions = []
-            for k in close:
-                if self.keys[k] not in suggestions:
-                    suggestions.append(self.keys[k])
-            raise LookupError(suggestions)
+            raise LookupError(self.suggest(key))
         entry = self.cards[name]
         printing = entry["latest"]
         if set_code:
-            printing = entry["sets"].get(set_code.upper())
+            sets = self._sets_of(name)
+            printing = sets.get(set_code.upper())
             if printing is None:
                 raise LookupError(
                     [], f"no English paper printing in set {set_code.upper()} "
-                        f"(available: {', '.join(sorted(entry['sets']))})"
+                        f"(available: {', '.join(sorted(sets))})"
                 )
         return entry["card"], printing
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=".pkl")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _link_sets(cards: dict, sets: dict) -> dict:
+    """Put each card's latest printing back where card_sets.pkl marks it with None."""
+    for name, by_set in sets.items():
+        for code, printing in by_set.items():
+            if printing is None:
+                by_set[code] = cards[name]["latest"]
+    return sets
+
+
+def _cache_files(data_path: Path) -> tuple[Path, Path]:
+    cache = data_path.parent / ".cache"
+    return cache / "card_index.pkl", cache / "card_sets.pkl"
+
+
+def _stamp(data_path: Path) -> tuple:
+    st = data_path.stat()
+    return (INDEX_VERSION, data_path.name, st.st_size, int(st.st_mtime))
+
+
+def _char_counts(keys: list[str]):
+    """(keys, key lengths, sorted alphabet of code points, keys x alphabet count matrix)."""
+    lengths = np.fromiter(map(len, keys), dtype=np.int64, count=len(keys))
+    codes = np.frombuffer("".join(keys).encode("utf-32-le", "surrogatepass"),
+                          dtype=np.uint32)
+    alphabet, idx = np.unique(codes, return_inverse=True)
+    owner = np.repeat(np.arange(len(keys)), lengths)
+    counts = np.bincount(owner * len(alphabet) + idx, minlength=len(keys) * len(alphabet))
+    return keys, lengths, alphabet, counts.reshape(len(keys), len(alphabet)).astype(np.uint16)
 
 
 def find_data_file(start: Path) -> Path | None:

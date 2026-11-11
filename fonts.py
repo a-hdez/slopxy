@@ -40,9 +40,13 @@ def _path_for(role: str) -> str | None:
     return None
 
 
+def font(role: str, size: float) -> ImageFont.FreeTypeFont:
+    # Round before the cache lookup so fractional sizes share one font object per pixel size.
+    return _font(role, max(1, int(round(size))))
+
+
 @lru_cache(maxsize=512)
-def font(role: str, size: int) -> ImageFont.FreeTypeFont:
-    size = max(1, int(round(size)))
+def _font(role: str, size: int) -> ImageFont.FreeTypeFont:
     path = _path_for(role)
     if path:
         return ImageFont.truetype(path, size)

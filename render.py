@@ -143,11 +143,13 @@ def _title_bar(img, rect, face: Face, pal, pal2, cost_d=38, name_size=40, opacit
     if opacity >= 1:
         _shape(img, rect, 12, a, b, outline=pal.edge, width=3)
     else:
-        layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        _shape(layer, rect, 12, a, b)
+        # Draw the fill on a layer just the size of the bar, then composite it in place.
+        bx0, by0, bx1, by1 = (int(round(v)) for v in rect)
+        layer = Image.new("RGBA", (bx1 - bx0 + 1, by1 - by0 + 1), (0, 0, 0, 0))
+        _shape(layer, (0, 0, bx1 - bx0, by1 - by0), 12, a, b)
         layer.putalpha(layer.getchannel("A").point(lambda v: round(v * opacity)))
-        img.alpha_composite(layer)
-        ImageDraw.Draw(img).rounded_rectangle([int(round(v)) for v in rect], 12,
+        img.alpha_composite(layer, (bx0, by0))
+        ImageDraw.Draw(img).rounded_rectangle([bx0, by0, bx1, by1], 12,
                                               outline=pal.edge, width=3)
     x0, y0, x1, y1 = rect
     cy = (y0 + y1) / 2
@@ -155,16 +157,34 @@ def _title_bar(img, rect, face: Face, pal, pal2, cost_d=38, name_size=40, opacit
     d = ImageDraw.Draw(img)
     f = _fit_font(d, face.name, "title", name_size, left - (x0 + 18) - 10)
     if opacity < 1:  # soft light glow so the name reads over dark art
-        # Blur only the shape and fill it with solid glow color: blurring an RGBA layer
-        # would mix its transparent black into the halo and leave dark fringes.
-        shape = Image.new("L", img.size, 0)
-        _ctext(ImageDraw.Draw(shape), (x0 + 18, cy), face.name, font=f, fill=255,
-               anchor="lm", stroke_width=5, stroke_fill=255)
-        shape = shape.filter(ImageFilter.GaussianBlur(5))
-        glow = Image.new("RGBA", img.size, GLOW_COLOR + (0,))
-        glow.putalpha(shape.point(lambda v: round(min(255, v * 2) * GLOW_OPACITY)))
-        img.alpha_composite(glow)
+        _glow(img, (x0 + 18, cy), face.name, f)
     _ctext(d, (x0 + 18, cy), face.name, font=f, fill=TEXT_INK, anchor="lm")
+
+
+GLOW_STROKE = 5
+GLOW_BLUR = 5
+GLOW_MARGIN = 6 * GLOW_BLUR  # beyond the blur's reach, so cropping changes no pixel
+
+
+def _glow(img: Image.Image, xy, text: str, f) -> None:
+    """Soft halo behind `text` drawn with _ctext(..., anchor="lm") at xy.
+    Blur only the shape and fill it with solid glow color: blurring an RGBA layer would mix
+    its transparent black into the halo and leave dark fringes. Works on a crop around the
+    text instead of the whole card."""
+    cap = -f.getbbox("H", anchor="ls")[1]
+    pos = (xy[0], xy[1] + cap / 2)
+    tx0, ty0, tx1, ty1 = ImageDraw.Draw(img).textbbox(pos, text, font=f, anchor="ls",
+                                                      stroke_width=GLOW_STROKE)
+    cx0, cy0 = max(0, int(tx0) - GLOW_MARGIN), max(0, int(ty0) - GLOW_MARGIN)
+    cx1 = min(img.width, int(tx1) + 1 + GLOW_MARGIN)
+    cy1 = min(img.height, int(ty1) + 1 + GLOW_MARGIN)
+    shape = Image.new("L", (cx1 - cx0, cy1 - cy0), 0)
+    ImageDraw.Draw(shape).text((pos[0] - cx0, pos[1] - cy0), text, font=f, fill=255,
+                               anchor="ls", stroke_width=GLOW_STROKE, stroke_fill=255)
+    shape = shape.filter(ImageFilter.GaussianBlur(GLOW_BLUR))
+    glow = Image.new("RGBA", shape.size, GLOW_COLOR + (0,))
+    glow.putalpha(shape.point(lambda v: round(min(255, v * 2) * GLOW_OPACITY)))
+    img.alpha_composite(glow, (cx0, cy0))
 
 
 def _type_bar(img, rect, face: Face, printing, pal, pal2, size=33):
@@ -363,25 +383,29 @@ def _dfc_note(raw_faces, i, labels) -> str:
     return f"{labels[i].title()} face • {'back' if i == 0 else 'front'}: {other}"
 
 
-def render_card(card: dict, printing: dict, full_art: bool = False) -> list[Rendered]:
-    """Render a card into one or more images, each with its art window(s)."""
+def render_card(card: dict, printing: dict, full_art: bool = False,
+                only: str | None = None) -> list[Rendered]:
+    """Render a card into one or more images, each with its art window(s).
+    only: render just the double-faced card face with this suffix (e.g. "_back")."""
     layout = card.get("layout", "normal")
     raw_faces = card.get("faces") or []
     labels = ["front", "back"] + [f"face{i}" for i in range(3, len(raw_faces) + 1)]
+    dfc = [i for i in range(len(raw_faces)) if only is None or f"_{labels[i]}" == only]
     if full_art:
         if raw_faces and layout in DFC_LAYOUTS:
-            return [Rendered(f"_{labels[i]}", *render_full_art(_face(rf, card, printing, i),
-                                                               _dfc_note(raw_faces, i, labels)))
-                    for i, rf in enumerate(raw_faces)]
+            return [Rendered(f"_{labels[i]}", *render_full_art(
+                        _face(raw_faces[i], card, printing, i), _dfc_note(raw_faces, i, labels)))
+                    for i in dfc]
         if raw_faces and layout in SIDE_PANEL_LAYOUTS | {"flip"}:
             face = _face(raw_faces[0], card, printing, 0)
             face.colors = card.get("colors", face.colors)
             return [Rendered("", *render_full_art(face))]
         return [Rendered("", *render_full_art(_face(card, card, printing, None)))]
     if raw_faces and layout in DFC_LAYOUTS:
-        return [Rendered(f"_{labels[i]}", *render_standard(_face(rf, card, printing, i), printing,
-                                                            _dfc_note(raw_faces, i, labels)))
-                for i, rf in enumerate(raw_faces)]
+        return [Rendered(f"_{labels[i]}", *render_standard(
+                    _face(raw_faces[i], card, printing, i), printing,
+                    _dfc_note(raw_faces, i, labels)))
+                for i in dfc]
     if raw_faces and len(raw_faces) == 2 and layout in SIDE_PANEL_LAYOUTS:
         main = _face(raw_faces[0], card, printing, 0)
         main.power = main.power if main.power is not None else card.get("power")

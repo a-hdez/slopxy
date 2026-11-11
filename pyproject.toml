@@ -10,9 +10,17 @@ readme = "README.md"
 license = "Unlicense"
 requires-python = ">=3.10"
 dependencies = [
-    "pillow>=10",
+    "pillow>=10.1",  # ImageFont.load_default(size)
     "numpy>=1.24",
+    "tomli>=1.1; python_version < '3.11'",
 ]
+
+# Hosted art backends; ComfyUI, Automatic1111/Forge and the placeholder need none of these.
+[project.optional-dependencies]
+openai = ["openai>=3.49"]
+gemini = ["google-genai>=3.0"]
+anthropic = ["anthropic>=2.8"]
+all = ["openai>=3.49", "google-genai>=3.0", "anthropic>=2.8"]
 
 [project.scripts]
 slopxy = "slopxy.cli:main"

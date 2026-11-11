@@ -1,5 +1,8 @@
 """ComfyUI backend: a minimal HTTP API client (stdlib only), the model presets, and the image
-and text backends that fill in the workflow templates in workflows/."""
+and text backends that fill in the workflow templates in workflows/.
+
+Profile settings: url (default http://127.0.0.1:8189), model (a preset name below, default
+krea2-turbo), checkpoint (another model file of the preset's family)."""
 
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from . import ArtError
+from . import PLAIN_STYLE, SD_SIZES, ArtError, ArtUnavailable, ImageCaps
 
 DEFAULT_URL = "http://127.0.0.1:8189"  # ComfyUI Desktop's default port
 WORKFLOW_DIR = Path(__file__).parent / "workflows"
@@ -25,10 +28,7 @@ PRESETS = {
     # so it gets plain-language style, no flavor quotes and no "card" wording.
     "krea2-turbo": {"workflow": "krea2_turbo.json",
                     "checkpoint": "krea2_turbo_int8_convrot.safetensors",
-                    "style": ("epic fantasy digital painting, full-bleed illustration filling the "
-                              "entire image, dramatic lighting, highly detailed. The image contains "
-                              "no text, no letters, no border and no frame"),
-                    "flavor": False},
+                    "style": PLAIN_STYLE, "flavor": False, "negative": False},
     "sdxl-turbo": {"workflow": "sdxl_turbo.json",
                    "checkpoint": "dreamshaperXL_v21TurboDPMSDE.safetensors"},
     "flux": {"workflow": "flux_dev.json", "checkpoint": "flux1-dev-fp8.safetensors"},
@@ -40,6 +40,10 @@ LOADER_INPUT = {"CheckpointLoaderSimple": "ckpt_name", "UNETLoader": "unet_name"
 
 
 class ComfyError(ArtError):
+    pass
+
+
+class ComfyUnreachable(ComfyError, ArtUnavailable):
     pass
 
 
@@ -60,7 +64,7 @@ class ComfyClient:
         try:
             return self._get_json("/system_stats", timeout=5)
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise ComfyError(
+            raise ComfyUnreachable(
                 f"ComfyUI is not reachable at {self.url} ({e}). "
                 "Open ComfyUI Desktop and retry, or pass --comfy-url."
             ) from None
@@ -128,17 +132,47 @@ def _load_workflow(name: str) -> dict:
     return json.loads((WORKFLOW_DIR / name).read_text())
 
 
+_CLIENTS: dict[str, ComfyClient] = {}
+
+
+def _client(settings: dict) -> ComfyClient:
+    """One checked client per ComfyUI address, shared by the image and text backends."""
+    url = (settings.get("url") or DEFAULT_URL).rstrip("/")
+    if url not in _CLIENTS:
+        client = ComfyClient(url, timeout=float(settings.get("timeout", 600)))
+        client.check()
+        _CLIENTS[url] = client
+    return _CLIENTS[url]
+
+
+def image_backend(settings: dict) -> "ComfyImageBackend":
+    return ComfyImageBackend(_client(settings), settings.get("model") or DEFAULT_MODEL,
+                             settings.get("checkpoint"))
+
+
+def text_backend(settings: dict) -> "ComfyTextBackend":
+    return ComfyTextBackend(_client(settings))
+
+
 class ComfyImageBackend:
     """Image generation with one model preset. The workflow's node ids are fixed: "1" loads
     the model, "2"/"3" are the positive/negative prompts, "4" the latent size, "5" the sampler."""
 
+    name = "comfyui"
+    concurrency = 1  # one GPU: ComfyUI runs its queue in order anyway
+    paid = False
+
     def __init__(self, client: ComfyClient, model: str = DEFAULT_MODEL,
                  checkpoint: str | None = None):
+        if model not in PRESETS:
+            raise ComfyError(f"unknown ComfyUI preset '{model}' (presets: {', '.join(PRESETS)})")
         self.client = client
         self.model = model
         preset = PRESETS[model]
         self.style = preset.get("style")
         self.flavor = preset.get("flavor", True)
+        self.caps = ImageCaps(sizes=list(SD_SIZES), seed=True,
+                              negative=preset.get("negative", True))
         self.template = _load_workflow(preset["workflow"])
         self.loader = self.template["1"]["class_type"]
         self.loader_input = LOADER_INPUT[self.loader]
@@ -154,12 +188,15 @@ class ComfyImageBackend:
         raise ComfyError(f"Model '{wanted}' not found by ComfyUI's {self.loader}. Available: "
                          + ", ".join(available))
 
+    def spec_fields(self) -> dict:
+        return {"checkpoint": self.checkpoint}
+
     def generate(self, spec: dict) -> Image.Image:
         wf = copy.deepcopy(self.template)
         wf["1"]["inputs"][self.loader_input] = spec["checkpoint"]
         wf["2"]["inputs"]["text"] = spec["positive"]
         if wf["3"]["class_type"] == "CLIPTextEncode":
-            wf["3"]["inputs"]["text"] = spec["negative"]
+            wf["3"]["inputs"]["text"] = spec.get("negative", "")
         wf["4"]["inputs"]["width"], wf["4"]["inputs"]["height"] = spec["width"], spec["height"]
         wf["5"]["inputs"]["seed"] = spec["seed"]
         img = Image.open(io.BytesIO(self.client.run(wf)))
@@ -171,9 +208,14 @@ class ComfyTextBackend:
     """The language model behind scene descriptions: Qwen3-VL through ComfyUI's Generate Text
     node (workflows/describe.json)."""
 
+    name = "comfyui"
+    concurrency = 1
+    paid = False
+
     def __init__(self, client: ComfyClient):
         self.client = client
         self.template = _load_workflow("describe.json")
+        self.model = self.template["1"]["inputs"]["clip_name"].rsplit(".", 1)[0]
 
     def complete(self, prompt: str, seed: int) -> str:
         wf = copy.deepcopy(self.template)
